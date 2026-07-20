@@ -4,6 +4,13 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Drew's Kitchen</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Drew's Kitchen">
+<meta name="theme-color" content="#C2185B">
 <style>
   @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
 
@@ -136,6 +143,9 @@
     parseMessage: null,
     orders: [],
     ordersLoading: false,
+    archivedOrders: [],
+    archivedLoading: false,
+    showArchived: false,
   };
 
   function emptyMeal() {
@@ -210,7 +220,8 @@
         if (cells.length < 2) return;
         const dayCell = cells[0];
         const mealCell = cells[1];
-        const ingredientsCell = cells[2];
+        const priceCell = cells[2];
+        const ingredientsCell = cells[3];
 
         const day = dayCell ? dayCell.textContent.trim() : '';
         const mealClone = mealCell ? mealCell.cloneNode(true) : null;
@@ -232,11 +243,14 @@
         }
 
         const match = existingByName[name.toLowerCase()];
+        const priceText = priceCell ? priceCell.textContent.replace(/[^0-9.]/g, '').trim() : '';
+        const parsedPrice = priceText && !isNaN(parseFloat(priceText)) ? priceText : '';
+
         meals.push({
           id: 'm' + Math.random().toString(36).slice(2, 9),
           name,
           description: ingredients.join(' · '),
-          price: match ? match.price : '',
+          price: parsedPrice || (match ? match.price : ''),
           imageUrl: imageUrl || (match ? match.imageUrl : ''),
           day,
         });
@@ -547,14 +561,71 @@
 
   async function clearAllOrders() {
     if (state.orders.length === 0) return;
-    const proceed = confirm(`Delete all ${state.orders.length} order${state.orders.length !== 1 ? 's' : ''} for ${state.menu.weekLabel}? This can't be undone.`);
+    const proceed = confirm(`Move all ${state.orders.length} order${state.orders.length !== 1 ? 's' : ''} for ${state.menu.weekLabel} to the archive? You can restore them from "Archived orders" below if needed.`);
     if (!proceed) return;
     try {
-      await Promise.all(state.orders.map(o => window.storage.delete(o.key)));
+      await Promise.all(state.orders.map(async (o) => {
+        const { key: _k, ...orderData } = o;
+        await window.storage.set(`archived:${o.key}`, JSON.stringify(orderData));
+        await window.storage.delete(o.key);
+      }));
       state.orders = [];
       render();
     } catch (e) {
       alert('Could not clear all orders. Please try again.');
+    }
+  }
+
+  async function loadArchivedOrders(weekLabel) {
+    state.archivedLoading = true; render();
+    try {
+      const list = await window.storage.list(`archived:order:${weekLabel}:`);
+      const keys = (list && list.keys) || [];
+      const results = await Promise.all(keys.map(async k => {
+        try { const r = await window.storage.get(k); return r ? { key: k, ...JSON.parse(r.value) } : null; }
+        catch { return null; }
+      }));
+      state.archivedOrders = results.filter(Boolean).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    } catch (e) {
+      state.archivedOrders = [];
+    }
+    state.archivedLoading = false; render();
+  }
+
+  function toggleShowArchived() {
+    state.showArchived = !state.showArchived;
+    if (state.showArchived) loadArchivedOrders(state.menu.weekLabel);
+    render();
+  }
+
+  async function restoreOrder(archivedKey) {
+    try {
+      const res = await window.storage.get(archivedKey);
+      if (!res) return;
+      const originalKey = archivedKey.slice('archived:'.length);
+      const result = await window.storage.set(originalKey, res.value);
+      if (!result) throw new Error('save failed');
+      await window.storage.delete(archivedKey);
+      state.archivedOrders = state.archivedOrders.filter(o => o.key !== archivedKey);
+      loadOrders(state.menu.weekLabel);
+    } catch (e) {
+      alert('Could not restore that order. Please try again.');
+    }
+  }
+
+  async function restoreAllArchived() {
+    if (state.archivedOrders.length === 0) return;
+    try {
+      await Promise.all(state.archivedOrders.map(async (o) => {
+        const originalKey = o.key.slice('archived:'.length);
+        const { key: _k, ...orderData } = o;
+        await window.storage.set(originalKey, JSON.stringify(orderData));
+        await window.storage.delete(o.key);
+      }));
+      state.archivedOrders = [];
+      loadOrders(state.menu.weekLabel);
+    } catch (e) {
+      alert('Could not restore all orders. Please try again.');
     }
   }
 
@@ -583,8 +654,17 @@
   }
 
   async function deleteOrder(key) {
-    try { await window.storage.delete(key); state.orders = state.orders.filter(o => o.key !== key); render(); }
-    catch (e) { /* ignore */ }
+    const order = state.orders.find(o => o.key === key);
+    if (!order) return;
+    try {
+      const { key: _k, ...orderData } = order;
+      await window.storage.set(`archived:${key}`, JSON.stringify(orderData));
+      await window.storage.delete(key);
+      state.orders = state.orders.filter(o => o.key !== key);
+      render();
+    } catch (e) {
+      alert('Could not remove that order. Please try again.');
+    }
   }
 
   function exportCSV() {
@@ -881,6 +961,31 @@
           </div>
         </div>`;
 
+    const archivedHtml = `
+      <button class="btn-ghost" onclick="toggleShowArchived()" style="font-size:12px;">${state.showArchived ? '▲' : '▼'} Archived orders</button>
+      ${state.showArchived ? `
+        <div style="margin-top:10px;">
+          ${state.archivedLoading
+            ? `<p style="color:var(--inkSoft);font-size:13px;">Loading…</p>`
+            : state.archivedOrders.length === 0
+            ? `<p style="color:var(--inkSoft);font-size:13px;">Nothing archived for this week.</p>`
+            : `
+              <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:10px;">
+                ${state.archivedOrders.map(o => `
+                  <div style="background:#FDF7F9;border:1px dashed var(--line);border-radius:10px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;">
+                    <div>
+                      <strong style="font-size:13px;">${escapeHtml(o.customerName)}</strong>
+                      <span class="mono" style="font-size:12px;color:var(--inkSoft);margin-left:8px;">$${o.total.toFixed(2)}</span>
+                    </div>
+                    <button class="btn-ghost" onclick="restoreOrder('${o.key}')" style="font-size:11px;">↺ Restore</button>
+                  </div>`).join('')}
+              </div>
+              <button class="btn-ghost" onclick="restoreAllArchived()" style="font-size:12px;">↺ Restore all</button>
+            `}
+        </div>
+      ` : ''}
+    `;
+
     return `
       <div style="max-width:720px;margin:0 auto;padding:24px 16px 60px;">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
@@ -944,6 +1049,7 @@
             <button class="btn-icon" onclick="reloadOrders()">🧾</button>
           </div>
           ${ordersHtml}
+          <div style="margin-top:16px;">${archivedHtml}</div>
         </div>
 
         <div style="border-top:1px solid var(--line);padding-top:24px;margin-top:24px;">
