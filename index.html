@@ -194,47 +194,54 @@
   function parseMenuDocHtml(html, existingMeals) {
     const container = document.createElement('div');
     container.innerHTML = html;
-    const weekMatch = (container.querySelector('h1') || {}).textContent && container.querySelector('h1').textContent.match(/week\s+(\d+)/i);
+    const h1 = container.querySelector('h1');
+    const weekMatch = h1 && h1.textContent.match(/week\s+(\d+)/i);
     const weekLabel = weekMatch ? `Week ${weekMatch[1]}` : null;
 
     const existingByName = {};
     (existingMeals || []).forEach(m => { if (m.name) existingByName[m.name.trim().toLowerCase()] = m; });
 
     const meals = [];
-    let currentDay = null;
-    Array.from(container.children).forEach(node => {
-      const tag = node.tagName && node.tagName.toLowerCase();
-      if (tag === 'h2') {
-        currentDay = node.textContent.trim();
-      } else if (tag === 'ul') {
-        Array.from(node.children).forEach(li => {
-          if (!li.tagName || li.tagName.toLowerCase() !== 'li') return;
-          const clone = li.cloneNode(true);
-          const nestedUl = clone.querySelector('ul');
-          let ingredients = [];
-          if (nestedUl) {
-            ingredients = Array.from(nestedUl.children)
-              .filter(x => x.tagName && x.tagName.toLowerCase() === 'li')
-              .map(x => x.textContent.trim());
-            nestedUl.remove();
-          }
-          const imgEl = clone.querySelector('img');
-          const imageUrl = imgEl ? imgEl.getAttribute('src') : '';
-          if (imgEl) imgEl.remove();
-          const name = clone.textContent.trim();
-          if (!name) return;
-          const match = existingByName[name.toLowerCase()];
-          meals.push({
-            id: 'm' + Math.random().toString(36).slice(2, 9),
-            name,
-            description: ingredients.join(' · '),
-            price: match ? match.price : '',
-            imageUrl: imageUrl || (match ? match.imageUrl : ''),
-            day: currentDay || '',
-          });
+    const table = container.querySelector('table');
+    if (table) {
+      const bodyRows = table.querySelectorAll('tbody tr').length ? table.querySelectorAll('tbody tr') : table.querySelectorAll('tr');
+      Array.from(bodyRows).forEach(row => {
+        const cells = Array.from(row.children).filter(c => c.tagName && /^(td|th)$/i.test(c.tagName));
+        if (cells.length < 2) return;
+        const dayCell = cells[0];
+        const mealCell = cells[1];
+        const ingredientsCell = cells[2];
+
+        const day = dayCell ? dayCell.textContent.trim() : '';
+        const mealClone = mealCell ? mealCell.cloneNode(true) : null;
+        let imageUrl = '';
+        if (mealClone) {
+          const imgEl = mealClone.querySelector('img');
+          if (imgEl) { imageUrl = imgEl.getAttribute('src') || ''; imgEl.remove(); }
+        }
+        const name = mealClone ? mealClone.textContent.trim() : '';
+        if (!name) return;
+
+        let ingredients = [];
+        if (ingredientsCell) {
+          const paras = Array.from(ingredientsCell.querySelectorAll('p'));
+          const texts = (paras.length ? paras.map(p => p.textContent.trim()) : [ingredientsCell.textContent.trim()]).filter(Boolean);
+          ingredients = (texts.length === 1 && texts[0].includes(','))
+            ? texts[0].split(',').map(s => s.trim()).filter(Boolean)
+            : texts;
+        }
+
+        const match = existingByName[name.toLowerCase()];
+        meals.push({
+          id: 'm' + Math.random().toString(36).slice(2, 9),
+          name,
+          description: ingredients.join(' · '),
+          price: match ? match.price : '',
+          imageUrl: imageUrl || (match ? match.imageUrl : ''),
+          day,
         });
-      }
-    });
+      });
+    }
     return { weekLabel, meals };
   }
 
@@ -272,7 +279,7 @@
       const result = await window.mammoth.convertToHtml({ arrayBuffer });
       const { weekLabel, meals } = parseMenuDocHtml(result.value, state.draftMenu.meals);
       if (meals.length === 0) {
-        state.parseMessage = { type: 'error', text: "Couldn't find any meals in that document — make sure day names use the Heading 2 style and each meal is a bulleted list item, like the template." };
+        state.parseMessage = { type: 'error', text: "Couldn't find any meals in that document — make sure the table rows and columns weren't deleted, like in the template." };
       } else {
         state.draftMenu = { ...state.draftMenu, weekLabel: weekLabel || state.draftMenu.weekLabel, meals };
         scheduleAutosave();
