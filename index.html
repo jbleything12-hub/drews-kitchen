@@ -1,0 +1,721 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Drew's Kitchen</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@500;600&display=swap');
+
+  :root {
+    --paper: #FAF6EE;
+    --paperDim: #F1EBDC;
+    --ink: #2B2622;
+    --inkSoft: #6B6055;
+    --basil: #43563A;
+    --rust: #B5502D;
+    --butter: #E8C468;
+    --line: #DDD2BE;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--paper); color: var(--ink); font-family: 'Inter', sans-serif; }
+  #app { min-height: 100vh; }
+  .display { font-family: 'Fraunces', serif; }
+  .mono { font-family: 'IBM Plex Mono', monospace; }
+  input, textarea, button { font-family: 'Inter', sans-serif; }
+  input:focus, button:focus-visible, textarea:focus { outline: 2px solid var(--basil); outline-offset: 2px; }
+  .btn-primary {
+    background: var(--basil); color: #fff; border: none; border-radius: 10px; padding: 13px 18px;
+    font-size: 14px; font-weight: 600; cursor: pointer; width: 100%;
+  }
+  .btn-ghost {
+    background: transparent; border: 1px solid var(--line); color: var(--ink); border-radius: 8px;
+    padding: 8px 12px; font-size: 13px; cursor: pointer; display: inline-flex; align-items: center; gap: 6px;
+  }
+  .btn-icon { background: transparent; border: none; cursor: pointer; padding: 4px; display: inline-flex; align-items: center; }
+  .field {
+    width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+    font-size: 14px; background: #fff; color: var(--ink);
+  }
+  .label { display: block; font-size: 11px; color: var(--inkSoft); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .stepper-btn {
+    width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); background: #fff;
+    display: inline-flex; align-items: center; justify-content: center; cursor: pointer; color: var(--ink); font-size: 15px; line-height: 1;
+  }
+  .stepper-btn.add { background: var(--basil); color: #fff; border-color: var(--basil); }
+  .meal-card { background: #fff; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; display: flex; }
+  .ticket-edge {
+    background-image: radial-gradient(circle, var(--paper) 6px, transparent 6.5px);
+    background-position: top left; background-size: 20px 14px; background-repeat: repeat-x; height: 8px;
+  }
+  .loading { min-height: 100vh; display: flex; align-items: center; justify-content: center; font-size: 14px; color: var(--inkSoft); }
+  a.venmo-link { text-decoration: none; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+</head>
+<body>
+<div id="app"><div class="loading">Loading…</div></div>
+
+<script>
+  // ---------- Supabase-backed storage (mimics window.storage's get/set/delete/list) ----------
+  const SUPABASE_URL = 'https://crufaonqcxodsghirrwc.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_EWI9uKlSAgMWnor_H4Z_TQ_ITMizzeO';
+  const REST = `${SUPABASE_URL}/rest/v1/kv_store`;
+  function sbHeaders(extra) {
+    return { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', ...extra };
+  }
+  window.storage = {
+    async get(key) {
+      try {
+        const res = await fetch(`${REST}?key=eq.${encodeURIComponent(key)}&select=value`, { headers: sbHeaders() });
+        if (!res.ok) return null;
+        const rows = await res.json();
+        if (!rows.length) return null;
+        return { key, value: rows[0].value };
+      } catch (e) { return null; }
+    },
+    async set(key, value) {
+      try {
+        const res = await fetch(`${REST}?on_conflict=key`, {
+          method: 'POST',
+          headers: sbHeaders({ Prefer: 'resolution=merge-duplicates,return=minimal' }),
+          body: JSON.stringify([{ key, value, updated_at: new Date().toISOString() }]),
+        });
+        if (!res.ok) return null;
+        return { key, value };
+      } catch (e) { return null; }
+    },
+    async delete(key) {
+      try {
+        const res = await fetch(`${REST}?key=eq.${encodeURIComponent(key)}`, { method: 'DELETE', headers: sbHeaders() });
+        if (!res.ok) return null;
+        return { key, deleted: true };
+      } catch (e) { return null; }
+    },
+    async list(prefix) {
+      try {
+        const res = await fetch(`${REST}?key=like.${encodeURIComponent(prefix || '')}*&select=key`, { headers: sbHeaders() });
+        if (!res.ok) return null;
+        const rows = await res.json();
+        return { keys: rows.map(r => r.key) };
+      } catch (e) { return null; }
+    },
+  };
+
+  const PIN = '2468';
+  const DREW_VENMO = 'Andrew-Dzib-Galvan';
+  const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+
+  let state = {
+    loading: true,
+    view: 'order', // order | pinGate | kitchen
+    menu: { weekLabel: '', venmoUsername: '', meals: [] },
+    draftMenu: null,
+    qty: {},
+    customerName: '',
+    paymentStep: false,
+    paidCheckbox: false,
+    submitting: false,
+    confirmed: null,
+    orderError: '',
+    pinInput: '',
+    pinError: false,
+    saving: false,
+    pasteText: '',
+    parseMessage: null,
+    orders: [],
+    ordersLoading: false,
+  };
+
+  function emptyMeal() {
+    return { id: 'm' + Math.random().toString(36).slice(2, 9), name: '', description: '', price: '', imageUrl: '', day: '' };
+  }
+
+  function stripBullet(line) {
+    return line.replace(/^[•○o\-\*▪·]+\s*/, '').trim();
+  }
+
+  function parseMenuText(text, existingMeals) {
+    const lines = text.split(/\r?\n/).map(l => l.trim());
+    const weekMatch = text.match(/week\s+(\d+)/i);
+    const weekLabel = weekMatch ? `Week ${weekMatch[1]}` : null;
+
+    const dayIdxs = [];
+    lines.forEach((l, i) => {
+      const clean = l.replace(/:$/, '').toLowerCase();
+      if (DAY_NAMES.includes(clean)) dayIdxs.push({ idx: i, day: l.replace(/:$/, '') });
+    });
+
+    let blocks = [];
+    if (dayIdxs.length > 0) {
+      dayIdxs.forEach((d, i) => {
+        const end = i + 1 < dayIdxs.length ? dayIdxs[i + 1].idx : lines.length;
+        const blockLines = lines.slice(d.idx + 1, end).filter(l => l !== '');
+        if (blockLines.length > 0) blocks.push({ day: d.day, lines: blockLines });
+      });
+    } else {
+      text.split(/\n\s*\n/).forEach(rb => {
+        const bl = rb.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+        if (bl.length) blocks.push({ day: null, lines: bl });
+      });
+    }
+
+    const existingByName = {};
+    (existingMeals || []).forEach(m => { if (m.name) existingByName[m.name.trim().toLowerCase()] = m; });
+
+    const meals = blocks.map(b => {
+      const cleaned = b.lines.map(stripBullet).filter(Boolean);
+      const name = cleaned[0] || b.day || 'Meal';
+      const description = cleaned.slice(1).join(' · ');
+      const match = existingByName[name.trim().toLowerCase()];
+      return {
+        id: 'm' + Math.random().toString(36).slice(2, 9),
+        name, description,
+        price: match ? match.price : '',
+        imageUrl: match ? match.imageUrl : '',
+        day: b.day || '',
+      };
+    }).filter(m => m.name);
+
+    return { weekLabel, meals };
+  }
+
+  function parseMenuDocHtml(html, existingMeals) {
+    const container = document.createElement('div');
+    container.innerHTML = html;
+    const weekMatch = (container.querySelector('h1') || {}).textContent && container.querySelector('h1').textContent.match(/week\s+(\d+)/i);
+    const weekLabel = weekMatch ? `Week ${weekMatch[1]}` : null;
+
+    const existingByName = {};
+    (existingMeals || []).forEach(m => { if (m.name) existingByName[m.name.trim().toLowerCase()] = m; });
+
+    const meals = [];
+    let currentDay = null;
+    Array.from(container.children).forEach(node => {
+      const tag = node.tagName && node.tagName.toLowerCase();
+      if (tag === 'h2') {
+        currentDay = node.textContent.trim();
+      } else if (tag === 'ul') {
+        Array.from(node.children).forEach(li => {
+          if (!li.tagName || li.tagName.toLowerCase() !== 'li') return;
+          const clone = li.cloneNode(true);
+          const nestedUl = clone.querySelector('ul');
+          let ingredients = [];
+          if (nestedUl) {
+            ingredients = Array.from(nestedUl.children)
+              .filter(x => x.tagName && x.tagName.toLowerCase() === 'li')
+              .map(x => x.textContent.trim());
+            nestedUl.remove();
+          }
+          const imgEl = clone.querySelector('img');
+          const imageUrl = imgEl ? imgEl.getAttribute('src') : '';
+          if (imgEl) imgEl.remove();
+          const name = clone.textContent.trim();
+          if (!name) return;
+          const match = existingByName[name.toLowerCase()];
+          meals.push({
+            id: 'm' + Math.random().toString(36).slice(2, 9),
+            name,
+            description: ingredients.join(' · '),
+            price: match ? match.price : '',
+            imageUrl: imageUrl || (match ? match.imageUrl : ''),
+            day: currentDay || '',
+          });
+        });
+      }
+    });
+    return { weekLabel, meals };
+  }
+
+  let mammothLoadPromise = null;
+  function ensureMammothLoaded() {
+    if (window.mammoth) return Promise.resolve();
+    if (mammothLoadPromise) return mammothLoadPromise;
+    mammothLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js';
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('mammoth failed to load'));
+      document.head.appendChild(script);
+    });
+    return mammothLoadPromise;
+  }
+
+  async function handleDocxUpload(input) {
+    const file = input.files && input.files[0];
+    if (!file) return;
+    state.parseMessage = { type: 'info', text: 'Reading document…' }; render();
+    try {
+      await ensureMammothLoaded();
+      const arrayBuffer = await file.arrayBuffer();
+      const result = await window.mammoth.convertToHtml({ arrayBuffer });
+      const { weekLabel, meals } = parseMenuDocHtml(result.value, state.draftMenu.meals);
+      if (meals.length === 0) {
+        state.parseMessage = { type: 'error', text: "Couldn't find any meals in that document — make sure day names use the Heading 2 style and each meal is a bulleted list item, like the template." };
+      } else {
+        state.draftMenu = { ...state.draftMenu, weekLabel: weekLabel || state.draftMenu.weekLabel, meals };
+        const missingPrices = meals.filter(m => !m.price).length;
+        state.parseMessage = {
+          type: 'success',
+          text: `Parsed ${meals.length} meal${meals.length !== 1 ? 's' : ''}${weekLabel ? ` for ${weekLabel}` : ''} from the document.${missingPrices ? ` ${missingPrices} need a price before you publish.` : ''}`,
+        };
+      }
+    } catch (e) {
+      state.parseMessage = { type: 'error', text: "Could not read that file. Make sure it's a .docx saved from the template, or use the paste-text option below instead." };
+    }
+    input.value = '';
+    render();
+  }
+
+  function escapeHtml(str) {
+    return String(str == null ? '' : str).replace(/[&<>"']/g, s => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[s]));
+  }
+
+  // ---------- data loading ----------
+  async function loadMenu() {
+    try {
+      const res = await window.storage.get('menu');
+      if (res && res.value) {
+        state.menu = JSON.parse(res.value);
+      } else {
+        state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()] };
+      }
+    } catch (e) {
+      state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()] };
+    }
+    state.draftMenu = JSON.parse(JSON.stringify(state.menu));
+    state.loading = false;
+    render();
+  }
+
+  async function loadOrders(weekLabel) {
+    state.ordersLoading = true; render();
+    try {
+      const list = await window.storage.list(`order:${weekLabel}:`);
+      const keys = (list && list.keys) || [];
+      const results = await Promise.all(keys.map(async k => {
+        try { const r = await window.storage.get(k); return r ? { key: k, ...JSON.parse(r.value) } : null; }
+        catch { return null; }
+      }));
+      state.orders = results.filter(Boolean).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+    } catch (e) {
+      state.orders = [];
+    }
+    state.ordersLoading = false; render();
+  }
+
+  // ---------- derived ----------
+  function totalDue() {
+    return state.menu.meals.reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
+  }
+  function selectedCount() {
+    return Object.values(state.qty).reduce((a, b) => a + b, 0);
+  }
+  function grandTotal() {
+    return state.orders.reduce((s, o) => s + (o.total || 0), 0);
+  }
+
+  // ---------- actions ----------
+  function changeQty(id, delta) {
+    const next = Math.max(0, (state.qty[id] || 0) + delta);
+    state.qty = { ...state.qty, [id]: next };
+    render();
+  }
+
+  function setCustomerName(v) { state.customerName = v; }
+  function setPinInput(v) { state.pinInput = v; state.pinError = false; }
+  function setPasteText(v) { state.pasteText = v; }
+  function setWeekLabel(v) { state.draftMenu.weekLabel = v; }
+  function setVenmoUsername(v) { state.draftMenu.venmoUsername = v; }
+  function setMealField(id, field, v) {
+    state.draftMenu.meals = state.draftMenu.meals.map(m => m.id === id ? { ...m, [field]: v } : m);
+  }
+
+  function setPaidCheckbox(v) { state.paidCheckbox = v; render(); }
+
+  function goToPayment() {
+    state.orderError = '';
+    if (!state.customerName.trim()) { state.orderError = 'Enter your name so Drew knows whose order this is.'; render(); return; }
+    const items = state.menu.meals.filter(m => (state.qty[m.id] || 0) > 0);
+    if (items.length === 0) { state.orderError = 'Pick at least one meal before continuing.'; render(); return; }
+    state.paymentStep = true;
+    render();
+  }
+
+  function backToMeals() { state.paymentStep = false; render(); }
+
+  async function placeOrder() {
+    state.orderError = '';
+    if (!state.paidCheckbox) { state.orderError = "Check the box once you've sent payment to Drew."; render(); return; }
+    const items = state.menu.meals
+      .filter(m => (state.qty[m.id] || 0) > 0)
+      .map(m => ({ mealId: m.id, name: m.name, price: parseFloat(m.price) || 0, qty: state.qty[m.id] }));
+    if (items.length === 0) { state.orderError = 'Pick at least one meal before sending your order.'; render(); return; }
+
+    state.submitting = true; render();
+    try {
+      const orderId = 'o' + Date.now() + Math.random().toString(36).slice(2, 6);
+      const order = {
+        customerName: state.customerName.trim(), items, total: totalDue(), timestamp: Date.now(),
+        customerConfirmedPaid: true, paidConfirmed: false,
+      };
+      const result = await window.storage.set(`order:${state.menu.weekLabel}:${orderId}`, JSON.stringify(order));
+      if (!result) throw new Error('save failed');
+      state.confirmed = order;
+      state.paymentStep = false;
+      state.paidCheckbox = false;
+    } catch (e) {
+      state.orderError = 'Something went wrong sending your order. Please try again.';
+    }
+    state.submitting = false; render();
+  }
+
+  function venmoHref(amount, note) {
+    return `venmo://paycharge?txn=pay&recipients=${encodeURIComponent(DREW_VENMO)}&amount=${amount.toFixed(2)}&note=${encodeURIComponent(note)}`;
+  }
+  function venmoWebFallback() {
+    return `https://venmo.com/u/${encodeURIComponent(DREW_VENMO)}`;
+  }
+
+  function tryPin() {
+    if (state.pinInput === PIN) {
+      state.view = 'kitchen'; state.pinError = false; state.pinInput = '';
+      render();
+      loadOrders(state.draftMenu.weekLabel);
+    } else {
+      state.pinError = true; render();
+    }
+  }
+
+  function addDraftMeal() { state.draftMenu.meals = [...state.draftMenu.meals, emptyMeal()]; render(); }
+  function removeDraftMeal(id) { state.draftMenu.meals = state.draftMenu.meals.filter(m => m.id !== id); render(); }
+
+  async function publishMenu() {
+    const named = state.draftMenu.meals.filter(m => m.name.trim() !== '');
+    const missing = named.filter(m => !m.price).length;
+    if (missing > 0) {
+      const proceed = confirm(`${missing} meal${missing !== 1 ? 's' : ''} don't have a price yet. Publish anyway?`);
+      if (!proceed) return;
+    }
+    state.saving = true; render();
+    try {
+      const cleaned = { ...state.draftMenu, meals: named };
+      const result = await window.storage.set('menu', JSON.stringify(cleaned));
+      if (!result) throw new Error('save failed');
+      state.menu = cleaned;
+      state.draftMenu = JSON.parse(JSON.stringify(cleaned));
+    } catch (e) {
+      alert('Could not save the menu. Please try again.');
+    }
+    state.saving = false; render();
+  }
+
+  async function deleteOrder(key) {
+    try { await window.storage.delete(key); state.orders = state.orders.filter(o => o.key !== key); render(); }
+    catch (e) { /* ignore */ }
+  }
+
+  function exportCSV() {
+    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed']];
+    state.orders.forEach(o => {
+      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '']));
+      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No']);
+    });
+    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `${state.menu.weekLabel.replace(/\s+/g, '_')}_orders.csv`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function parseFromPaste() {
+    if (!state.pasteText.trim()) { state.parseMessage = { type: 'error', text: 'Paste the menu text first.' }; render(); return; }
+    const { weekLabel, meals } = parseMenuText(state.pasteText, state.draftMenu.meals);
+    if (meals.length === 0) {
+      state.parseMessage = { type: 'error', text: "Couldn't find any meals in that — make sure day names (Monday, Tuesday…) are on their own line above each meal." };
+      render(); return;
+    }
+    state.draftMenu = { ...state.draftMenu, weekLabel: weekLabel || state.draftMenu.weekLabel, meals };
+    const missingPrices = meals.filter(m => !m.price).length;
+    state.parseMessage = {
+      type: 'success',
+      text: `Parsed ${meals.length} meal${meals.length !== 1 ? 's' : ''}${weekLabel ? ` for ${weekLabel}` : ''}.${missingPrices ? ` ${missingPrices} need a price before you publish.` : ''}`,
+    };
+    state.pasteText = '';
+    render();
+  }
+
+  function openKitchen() { state.view = 'pinGate'; render(); }
+  function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; render(); }
+  function exitKitchen() { state.view = 'order'; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
+  function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
+
+  async function togglePaidConfirmed(key) {
+    const order = state.orders.find(o => o.key === key);
+    if (!order) return;
+    const updated = { ...order, paidConfirmed: !order.paidConfirmed };
+    delete updated.key;
+    try {
+      const result = await window.storage.set(key, JSON.stringify(updated));
+      if (!result) throw new Error('save failed');
+      state.orders = state.orders.map(o => o.key === key ? { ...updated, key } : o);
+      render();
+    } catch (e) {
+      alert('Could not update payment status. Please try again.');
+    }
+  }
+
+  // ---------- render ----------
+  function render() {
+    const app = document.getElementById('app');
+    if (state.loading) { app.innerHTML = '<div class="loading">Loading…</div>'; return; }
+    if (state.view === 'order') app.innerHTML = renderOrderView();
+    else if (state.view === 'pinGate') app.innerHTML = renderPinGate();
+    else if (state.view === 'kitchen') app.innerHTML = renderKitchenView();
+  }
+
+  function renderOrderView() {
+    if (state.confirmed) return renderConfirmation();
+
+    const meals = state.menu.meals;
+    const sc = selectedCount();
+    const td = totalDue();
+
+    const mealCards = meals.length === 0
+      ? `<div style="text-align:center;padding:60px 24px;color:var(--inkSoft);">No meals posted yet this week. Check back soon.</div>`
+      : `<div style="padding:0 16px;display:flex;flex-direction:column;gap:14px;">
+          ${meals.map(m => `
+            <div class="meal-card">
+              <div style="width:96px;min-width:96px;background:var(--paperDim);display:flex;align-items:center;justify-content:center;">
+                ${m.imageUrl
+                  ? `<img src="${escapeHtml(m.imageUrl)}" alt="${escapeHtml(m.name)}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none'">`
+                  : `<span style="font-size:22px;opacity:0.35;">🍽️</span>`}
+              </div>
+              <div style="flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:4px;">
+                ${m.day ? `<span class="mono" style="font-size:10.5px;color:var(--rust);letter-spacing:0.5px;text-transform:uppercase;">${escapeHtml(m.day)}</span>` : ''}
+                <div style="display:flex;justify-content:space-between;gap:8px;">
+                  <h3 style="font-size:15.5px;font-weight:600;margin:0;">${escapeHtml(m.name)}</h3>
+                  <span class="mono" style="font-size:14px;color:var(--rust);white-space:nowrap;">$${(parseFloat(m.price) || 0).toFixed(2)}</span>
+                </div>
+                ${m.description ? `<p style="font-size:12.5px;color:var(--inkSoft);margin:0;line-height:1.4;">${escapeHtml(m.description)}</p>` : ''}
+                <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                  <button class="stepper-btn" onclick="changeQty('${m.id}',-1)" aria-label="Remove one ${escapeHtml(m.name)}">−</button>
+                  <span class="mono" style="min-width:18px;text-align:center;font-size:14px;">${state.qty[m.id] || 0}</span>
+                  <button class="stepper-btn add" onclick="changeQty('${m.id}',1)" aria-label="Add one ${escapeHtml(m.name)}">+</button>
+                </div>
+              </div>
+            </div>
+          `).join('')}
+        </div>`;
+
+    const ticket = sc > 0 ? `
+      <div style="position:fixed;left:0;right:0;bottom:0;max-width:640px;margin:0 auto;">
+        <div class="ticket-edge"></div>
+        <div style="background:var(--ink);color:var(--paper);padding:14px 20px 18px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+            <span class="mono" style="font-size:12px;color:#C9C1B4;">${sc} meal${sc !== 1 ? 's' : ''} selected</span>
+            <span class="mono" style="font-size:18px;font-weight:600;">$${td.toFixed(2)}</span>
+          </div>
+          ${!state.paymentStep ? `
+            <input class="field" style="margin-bottom:8px;background:#3a332c;color:#fff;border-color:#544c42;" placeholder="Your name"
+              value="${escapeHtml(state.customerName)}" oninput="setCustomerName(this.value)">
+            ${state.orderError ? `<p style="color:var(--butter);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.orderError)}</p>` : ''}
+            <button class="btn-primary" onclick="goToPayment()">Continue to payment</button>
+          ` : `
+            <p style="font-size:12.5px;color:#C9C1B4;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong> to Drew, then check the box below to send your order.</p>
+            <a class="venmo-link" href="${venmoHref(td, `${state.menu.weekLabel} — ${state.customerName.trim()}`)}"><button class="btn-primary" style="background:#3D95CE;margin-bottom:6px;" type="button">Pay $${td.toFixed(2)} with Venmo</button></a>
+            <p style="font-size:11.5px;color:#9B9284;margin:0 0 10px;line-height:1.4;">On a computer? That button only opens the Venmo app on a phone. Instead, send <strong style="color:#C9C1B4;">$${td.toFixed(2)}</strong> to <strong style="color:#C9C1B4;">@${DREW_VENMO}</strong> with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(state.customerName.trim())}" via the Venmo app or <a href="${venmoWebFallback()}" style="color:#8FBF7A;">${venmoWebFallback()}</a>.</p>
+            <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#C9C1B4;margin-bottom:10px;cursor:pointer;">
+              <input type="checkbox" ${state.paidCheckbox ? 'checked' : ''} onchange="setPaidCheckbox(this.checked)" style="margin-top:2px;">
+              <span>I've sent $${td.toFixed(2)} to Drew via Venmo</span>
+            </label>
+            ${state.orderError ? `<p style="color:var(--butter);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.orderError)}</p>` : ''}
+            <button class="btn-primary" onclick="placeOrder()" ${state.submitting || !state.paidCheckbox ? 'disabled' : ''} style="opacity:${state.submitting || !state.paidCheckbox ? 0.6 : 1};margin-bottom:8px;">
+              ${state.submitting ? 'Sending…' : 'Submit order'}
+            </button>
+            <button class="btn-ghost" onclick="backToMeals()" style="width:100%;justify-content:center;background:transparent;border-color:#544c42;color:#C9C1B4;">Back to meals</button>
+          `}
+        </div>
+      </div>` : '';
+
+    return `
+      <div style="max-width:640px;margin:0 auto;padding-bottom:${sc > 0 ? 120 : 40}px;">
+        <header style="padding:32px 24px 20px;text-align:center;">
+          <span style="font-size:26px;">👨‍🍳</span>
+          <h1 class="display" style="font-size:28px;font-weight:700;margin:8px 0 2px;">Drew's Kitchen</h1>
+          <p class="mono" style="font-size:13px;color:var(--rust);letter-spacing:1px;text-transform:uppercase;margin:0;">${escapeHtml(state.menu.weekLabel || 'Menu coming soon')}</p>
+        </header>
+        ${mealCards}
+        <div style="text-align:center;padding:28px 24px 8px;">
+          <button class="btn-ghost" onclick="openKitchen()" style="font-size:12px;margin:0 auto;color:var(--inkSoft);">⚙ Drew's kitchen</button>
+        </div>
+        ${ticket}
+      </div>
+    `;
+  }
+
+  function renderConfirmation() {
+    const c = state.confirmed;
+    const receiptRows = c.items.map(it => `
+      <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
+        <span>${it.qty} × ${escapeHtml(it.name)}</span><span>$${(it.qty * it.price).toFixed(2)}</span>
+      </div>`).join('');
+
+    return `
+      <div style="max-width:480px;margin:0 auto;padding:60px 24px;">
+        <div style="text-align:center;">
+          <div style="width:56px;height:56px;border-radius:50%;background:var(--basil);display:flex;align-items:center;justify-content:center;margin:0 auto 16px;color:#fff;font-size:24px;">✓</div>
+          <h2 class="display" style="font-size:24px;font-weight:600;margin:0 0 4px;">Order sent to Drew</h2>
+          <p style="color:var(--inkSoft);font-size:14px;margin-bottom:24px;">Thanks, ${escapeHtml(c.customerName)}. Here's your ticket for ${escapeHtml(state.menu.weekLabel)}. Drew will confirm your payment came through.</p>
+        </div>
+        <div style="background:#fff;border:1px dashed var(--line);border-radius:10px;padding:16px 18px;">
+          ${receiptRows}
+          <div style="border-top:1px solid var(--line);margin-top:8px;padding-top:8px;display:flex;justify-content:space-between;">
+            <span class="mono" style="font-weight:600;font-size:13px;">TOTAL</span>
+            <span class="mono" style="font-weight:600;font-size:13px;">$${c.total.toFixed(2)}</span>
+          </div>
+        </div>
+        <p style="font-size:12px;color:var(--inkSoft);text-align:center;margin-top:16px;">
+          Didn't finish sending payment yet? Send <strong>$${c.total.toFixed(2)}</strong> to <strong>@${DREW_VENMO}</strong>
+          with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}" — or visit
+          <a href="${venmoWebFallback()}" style="color:var(--basil);">${venmoWebFallback()}</a>
+        </p>
+        <button class="btn-ghost" onclick="placeAnotherOrder()" style="width:100%;justify-content:center;margin-top:24px;">Place another order</button>
+      </div>
+    `;
+  }
+
+  function renderPinGate() {
+    return `
+      <div style="max-width:380px;margin:0 auto;padding:80px 24px 24px;">
+        <button class="btn-ghost" onclick="backToOrder()">← Back to menu</button>
+        <div style="margin-top:32px;text-align:center;">
+          <div style="font-size:24px;">🔒</div>
+          <h2 class="display" style="font-size:22px;margin:12px 0 4px;font-weight:600;">Drew's kitchen</h2>
+          <p style="color:var(--inkSoft);font-size:14px;margin-bottom:20px;">Enter the kitchen PIN to update the menu.</p>
+          <input class="field" type="password" inputmode="numeric" placeholder="PIN" id="pinField"
+            style="text-align:center;letter-spacing:4px;font-size:18px;"
+            value="${escapeHtml(state.pinInput)}"
+            oninput="setPinInput(this.value)"
+            onkeydown="if(event.key==='Enter') tryPin()">
+          ${state.pinError ? `<p style="color:var(--rust);font-size:13px;margin-top:8px;">That's not it — try again.</p>` : ''}
+          <button class="btn-primary" onclick="tryPin()" style="margin-top:16px;">Unlock</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function renderKitchenView() {
+    const dm = state.draftMenu;
+    const mealCards = dm.meals.map((m, idx) => `
+      <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;">
+        <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
+          <span class="mono" style="font-size:11px;color:var(--inkSoft);">MEAL ${idx + 1}</span>
+          <button class="btn-icon" style="color:var(--rust);" onclick="removeDraftMeal('${m.id}')">🗑</button>
+        </div>
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <input class="field" style="width:90px;" placeholder="Day" value="${escapeHtml(m.day)}" oninput="setMealField('${m.id}','day',this.value)">
+          <input class="field" style="flex:1;font-weight:600;" placeholder="Meal name" value="${escapeHtml(m.name)}" oninput="setMealField('${m.id}','name',this.value)">
+        </div>
+        <textarea class="field" rows="2" style="margin-bottom:8px;resize:vertical;" placeholder="Ingredients / description"
+          oninput="setMealField('${m.id}','description',this.value)">${escapeHtml(m.description)}</textarea>
+        <div style="display:flex;gap:8px;">
+          <div>
+            <input class="field" style="width:90px;" type="number" step="0.01" placeholder="Price" value="${escapeHtml(m.price)}" oninput="setMealField('${m.id}','price',this.value)">
+          </div>
+          <div style="flex:1;display:flex;align-items:center;gap:6px;">
+            <span style="font-size:14px;">🖼</span>
+            <input class="field" style="flex:1;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(m.imageUrl)}" oninput="setMealField('${m.id}','imageUrl',this.value)">
+          </div>
+        </div>
+      </div>
+    `).join('');
+
+    const ordersHtml = state.ordersLoading
+      ? `<p style="color:var(--inkSoft);font-size:13px;">Loading orders…</p>`
+      : state.orders.length === 0
+      ? `<p style="color:var(--inkSoft);font-size:13px;">No orders yet for this week.</p>`
+      : `
+        <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px;">
+          ${state.orders.map(o => `
+            <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;">
+              <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
+                <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
+                <div style="display:flex;align-items:center;gap:10px;">
+                  <span class="mono" style="font-size:14px;color:var(--rust);">$${o.total.toFixed(2)}</span>
+                  <button class="btn-icon" style="color:var(--inkSoft);" onclick="deleteOrder('${o.key}')">✕</button>
+                </div>
+              </div>
+              ${o.items.map(it => `
+                <div class="mono" style="font-size:12px;color:var(--inkSoft);display:flex;justify-content:space-between;">
+                  <span>${it.qty} × ${escapeHtml(it.name)}</span><span>$${(it.qty * it.price).toFixed(2)}</span>
+                </div>`).join('')}
+              <button onclick="togglePaidConfirmed('${o.key}')" style="margin-top:8px;border:none;cursor:pointer;border-radius:6px;padding:4px 10px;font-size:11px;font-weight:600;letter-spacing:0.3px;
+                background:${o.paidConfirmed ? 'var(--basil)' : '#F5E6D8'};color:${o.paidConfirmed ? '#fff' : 'var(--rust)'};">
+                ${o.paidConfirmed ? '✓ Paid — confirmed' : '⏳ Awaiting your confirmation'}
+              </button>
+            </div>`).join('')}
+        </div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+          <span class="mono" style="font-size:13px;font-weight:600;">Grand total: $${grandTotal().toFixed(2)}</span>
+          <button class="btn-ghost" onclick="exportCSV()">⬇ Export CSV</button>
+        </div>`;
+
+    return `
+      <div style="max-width:720px;margin:0 auto;padding:24px 16px 60px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;">
+          <button class="btn-ghost" onclick="exitKitchen()">← Back to menu</button>
+          <span class="mono" style="font-size:11px;color:var(--inkSoft);text-transform:uppercase;">Kitchen view</span>
+        </div>
+
+        <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 6px;">Drop in this week's menu</h2>
+        <p style="font-size:12.5px;color:var(--inkSoft);margin:0 0 10px;">
+          Fill out <a href="Weekly_Meal_Menu_Template.docx" download style="color:var(--basil);">the weekly template</a> and upload it here — it'll fill in the meal list below automatically.
+        </p>
+        <label class="btn-ghost" style="margin-bottom:14px;cursor:pointer;">
+          📄 Upload filled-out template (.docx)
+          <input type="file" accept=".docx" style="display:none;" onchange="handleDocxUpload(this)">
+        </label>
+
+        <details style="margin-bottom:16px;">
+          <summary style="font-size:12.5px;color:var(--inkSoft);cursor:pointer;">Or paste the menu text instead</summary>
+          <div style="margin-top:10px;">
+            <textarea class="field mono" rows="5" style="margin-bottom:8px;resize:vertical;font-size:12.5px;"
+              placeholder="Monday&#10;Salmon Bite Bowl&#10;  Salmon (GF Teriyaki Marinade)&#10;  Cucumber&#10;  Avocado&#10;&#10;Tuesday&#10;..."
+              oninput="setPasteText(this.value)">${escapeHtml(state.pasteText)}</textarea>
+            <button class="btn-ghost" onclick="parseFromPaste()">Parse pasted text</button>
+          </div>
+        </details>
+        ${state.parseMessage ? `<p style="font-size:12.5px;margin:0 0 24px;color:${state.parseMessage.type === 'error' ? 'var(--rust)' : state.parseMessage.type === 'info' ? 'var(--inkSoft)' : 'var(--basil)'};">${escapeHtml(state.parseMessage.text)}</p>` : '<div style="margin-bottom:24px;"></div>'}
+
+        <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 16px;">This week's menu</h2>
+
+        <div style="margin-bottom:16px;">
+          <label class="label">Week label</label>
+          <input class="field" placeholder="Week 21" value="${escapeHtml(dm.weekLabel)}" oninput="setWeekLabel(this.value)">
+        </div>
+
+        <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">${mealCards}</div>
+
+        <button class="btn-ghost" onclick="addDraftMeal()" style="margin-bottom:20px;">+ Add a meal</button>
+        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:36px;" ${state.saving ? 'disabled' : ''}>
+          ${state.saving ? 'Saving…' : 'Save & publish menu'}
+        </button>
+
+        <div style="border-top:1px solid var(--line);padding-top:24px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
+            <h2 class="display" style="font-size:22px;font-weight:600;margin:0;">Orders — ${escapeHtml(state.menu.weekLabel)}</h2>
+            <button class="btn-icon" onclick="reloadOrders()">🧾</button>
+          </div>
+          ${ordersHtml}
+        </div>
+      </div>
+    `;
+  }
+
+  loadMenu();
+</script>
+</body>
+</html>
