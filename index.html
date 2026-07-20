@@ -110,6 +110,7 @@
   };
 
   const DREW_VENMO = 'Andrew-Dzib-Galvan';
+  const DELIVERY_FEE = 5;
   const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
 
   let state = {
@@ -120,6 +121,7 @@
     auth: { pin: '2468', question: '', answer: '' },
     qty: {},
     customerName: '',
+    wantsDelivery: false,
     paymentStep: false,
     paidCheckbox: false,
     submitting: false,
@@ -357,8 +359,11 @@
   }
 
   // ---------- derived ----------
-  function totalDue() {
+  function mealsSubtotal() {
     return state.menu.meals.reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
+  }
+  function totalDue() {
+    return mealsSubtotal() + (state.wantsDelivery ? DELIVERY_FEE : 0);
   }
   function selectedCount() {
     return Object.values(state.qty).reduce((a, b) => a + b, 0);
@@ -376,6 +381,7 @@
   }
 
   function setCustomerName(v) { state.customerName = v; }
+  function setWantsDelivery(v) { state.wantsDelivery = v; render(); }
   function setPinInput(v) { state.pinInput = v; state.pinError = false; }
   function setPasteText(v) { state.pasteText = v; }
   function setWeekLabel(v) { state.draftMenu.weekLabel = v; scheduleAutosave(); }
@@ -413,6 +419,7 @@
       const orderId = 'o' + Date.now() + Math.random().toString(36).slice(2, 6);
       const order = {
         customerName: state.customerName.trim(), items, total: totalDue(), timestamp: Date.now(),
+        delivery: !!state.wantsDelivery,
         customerConfirmedPaid: true, paidConfirmed: false,
       };
       const result = await window.storage.set(`order:${state.menu.weekLabel}:${orderId}`, JSON.stringify(order));
@@ -420,6 +427,7 @@
       state.confirmed = order;
       state.paymentStep = false;
       state.paidCheckbox = false;
+      state.wantsDelivery = false;
     } catch (e) {
       state.orderError = 'Something went wrong sending your order. Please try again.';
     }
@@ -431,6 +439,24 @@
   }
   function venmoWebFallback() {
     return `https://venmo.com/u/${encodeURIComponent(DREW_VENMO)}`;
+  }
+
+  function buildOrderSummaryText(order) {
+    const lines = [];
+    lines.push(`Drew's Kitchen — ${state.menu.weekLabel}`);
+    lines.push('');
+    order.items.forEach(it => lines.push(`${it.qty} × ${it.name} — $${(it.qty * it.price).toFixed(2)}`));
+    if (order.delivery) lines.push(`Delivery — $${DELIVERY_FEE.toFixed(2)}`);
+    lines.push('');
+    lines.push(`TOTAL: $${order.total.toFixed(2)}`);
+    return lines.join('\n');
+  }
+  function isIOS() {
+    return /iPhone|iPad|iPod/i.test(navigator.userAgent);
+  }
+  function smsHref(body) {
+    const sep = isIOS() ? '&' : '?';
+    return `sms:${sep}body=${encodeURIComponent(body)}`;
   }
 
   async function enterKitchenView() {
@@ -699,10 +725,10 @@
   }
 
   function exportCSV() {
-    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed']];
+    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed', 'Delivery']];
     state.orders.forEach(o => {
-      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '']));
-      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No']);
+      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '', '']));
+      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No', o.delivery ? 'Yes' : 'No']);
     });
     const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -746,7 +772,7 @@
   function openKitchen() { state.view = 'pinGate'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function exitKitchen() { state.view = 'order'; render(); }
-  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.wantsDelivery = false; state.paymentStep = false; state.paidCheckbox = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
   async function togglePaidConfirmed(key) {
@@ -821,17 +847,26 @@
       <div style="position:fixed;left:0;right:0;bottom:0;max-width:640px;margin:0 auto;">
         <div class="ticket-edge"></div>
         <div style="background:var(--ink);color:var(--paper);padding:14px 20px 18px;">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:${state.wantsDelivery ? 2 : 10}px;">
             <span class="mono" style="font-size:12px;color:#D9AFC0;">${sc} meal${sc !== 1 ? 's' : ''} selected</span>
             <span class="mono" style="font-size:18px;font-weight:600;">$${td.toFixed(2)}</span>
           </div>
+          ${state.wantsDelivery ? `
+            <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
+              <span class="mono" style="font-size:11px;color:#C79AAE;">meals $${mealsSubtotal().toFixed(2)} + delivery $${DELIVERY_FEE.toFixed(2)}</span>
+            </div>
+          ` : ''}
           ${!state.paymentStep ? `
             <input class="field" style="margin-bottom:8px;background:#4F2438;color:#fff;border-color:#6B3550;" placeholder="Your name"
               value="${escapeHtml(state.customerName)}" oninput="setCustomerName(this.value)">
+            <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
+              <input type="checkbox" ${state.wantsDelivery ? 'checked' : ''} onchange="setWantsDelivery(this.checked)">
+              <span>🚚 Deliver my order (+$${DELIVERY_FEE.toFixed(2)})</span>
+            </label>
             ${state.orderError ? `<p style="color:var(--butter);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.orderError)}</p>` : ''}
             <button class="btn-primary" onclick="goToPayment()">Continue to payment</button>
           ` : `
-            <p style="font-size:12.5px;color:#D9AFC0;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong> to Drew, then check the box below to send your order.</p>
+            <p style="font-size:12.5px;color:#D9AFC0;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong>${state.wantsDelivery ? ` (includes $${DELIVERY_FEE.toFixed(2)} delivery)` : ''} to Drew, then check the box below to send your order.</p>
             <a class="venmo-link" href="${venmoHref(td, `${state.menu.weekLabel} — ${state.customerName.trim()}`)}"><button class="btn-primary" style="background:#3D95CE;margin-bottom:6px;" type="button">Pay $${td.toFixed(2)} with Venmo</button></a>
             <p style="font-size:11.5px;color:#C79AAE;margin:0 0 10px;line-height:1.4;">On a computer? That button only opens the Venmo app on a phone. Instead, send <strong style="color:#D9AFC0;">$${td.toFixed(2)}</strong> to <strong style="color:#D9AFC0;">@${DREW_VENMO}</strong> with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(state.customerName.trim())}" via the Venmo app or <a href="${venmoWebFallback()}" style="color:#F5A9C7;">${venmoWebFallback()}</a>.</p>
             <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
@@ -878,11 +913,20 @@
         </div>
         <div style="background:#fff;border:1px dashed var(--line);border-radius:10px;padding:16px 18px;">
           ${receiptRows}
+          ${c.delivery ? `
+            <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;color:var(--rust);">
+              <span>🚚 Delivery</span><span>$${DELIVERY_FEE.toFixed(2)}</span>
+            </div>` : ''}
           <div style="border-top:1px solid var(--line);margin-top:8px;padding-top:8px;display:flex;justify-content:space-between;">
             <span class="mono" style="font-weight:600;font-size:13px;">TOTAL</span>
             <span class="mono" style="font-weight:600;font-size:13px;">$${c.total.toFixed(2)}</span>
           </div>
         </div>
+        ${c.delivery ? `<p style="font-size:12.5px;color:var(--rust);text-align:center;margin-top:12px;font-weight:600;">🚚 Delivery requested — Drew will drop this off.</p>` : ''}
+        <a href="${smsHref(buildOrderSummaryText(c))}" style="text-decoration:none;display:block;margin-top:16px;">
+          <button class="btn-ghost" style="width:100%;justify-content:center;">📱 Text me my order</button>
+        </a>
+        <p style="font-size:11px;color:var(--inkSoft);text-align:center;margin-top:6px;">On a computer? This only opens a texting app on a phone — screenshot this page instead.</p>
         <p style="font-size:12px;color:var(--inkSoft);text-align:center;margin-top:16px;">
           Didn't finish sending payment yet? Send <strong>$${c.total.toFixed(2)}</strong> to <strong>@${DREW_VENMO}</strong>
           with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}" — or visit
@@ -979,7 +1023,10 @@
           ${state.orders.map(o => `
             <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;">
               <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
+                <div style="display:flex;align-items:center;gap:8px;">
+                  <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
+                  ${o.delivery ? `<span class="mono" style="font-size:10.5px;background:var(--paperDim);color:var(--rust);border-radius:6px;padding:2px 6px;font-weight:600;">🚚 DELIVERY</span>` : ''}
+                </div>
                 <div style="display:flex;align-items:center;gap:10px;">
                   <span class="mono" style="font-size:14px;color:var(--rust);">$${o.total.toFixed(2)}</span>
                   <button class="btn-icon" style="color:var(--inkSoft);" onclick="deleteOrder('${o.key}')">✕</button>
@@ -1017,6 +1064,7 @@
                   <div style="background:#FDF7F9;border:1px dashed var(--line);border-radius:10px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;">
                     <div>
                       <strong style="font-size:13px;">${escapeHtml(o.customerName)}</strong>
+                      ${o.delivery ? `<span class="mono" style="font-size:10px;color:var(--rust);margin-left:6px;">🚚</span>` : ''}
                       <span class="mono" style="font-size:12px;color:var(--inkSoft);margin-left:8px;">$${o.total.toFixed(2)}</span>
                     </div>
                     <button class="btn-ghost" onclick="restoreOrder('${o.key}')" style="font-size:11px;">↺ Restore</button>
