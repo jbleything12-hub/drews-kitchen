@@ -115,7 +115,7 @@
   let state = {
     loading: true,
     view: 'order', // order | pinGate | kitchen
-    menu: { weekLabel: '', venmoUsername: '', meals: [] },
+    menu: { weekLabel: '', venmoUsername: '', meals: [], orderingOpen: true },
     draftMenu: null,
     auth: { pin: '2468', question: '', answer: '' },
     qty: {},
@@ -319,11 +319,12 @@
       const res = await window.storage.get('menu');
       if (res && res.value) {
         state.menu = JSON.parse(res.value);
+        if (typeof state.menu.orderingOpen !== 'boolean') state.menu.orderingOpen = true;
       } else {
-        state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()] };
+        state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true };
       }
     } catch (e) {
-      state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()] };
+      state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true };
     }
     state.draftMenu = JSON.parse(JSON.stringify(state.menu));
     state.loading = false;
@@ -368,6 +369,7 @@
 
   // ---------- actions ----------
   function changeQty(id, delta) {
+    if (state.menu.orderingOpen === false) return;
     const next = Math.max(0, (state.qty[id] || 0) + delta);
     state.qty = { ...state.qty, [id]: next };
     render();
@@ -387,6 +389,7 @@
 
   function goToPayment() {
     state.orderError = '';
+    if (state.menu.orderingOpen === false) { state.orderError = 'Ordering is closed for this week.'; render(); return; }
     if (!state.customerName.trim()) { state.orderError = 'Enter your name so Drew knows whose order this is.'; render(); return; }
     const items = state.menu.meals.filter(m => (state.qty[m.id] || 0) > 0);
     if (items.length === 0) { state.orderError = 'Pick at least one meal before continuing.'; render(); return; }
@@ -398,6 +401,7 @@
 
   async function placeOrder() {
     state.orderError = '';
+    if (state.menu.orderingOpen === false) { state.orderError = 'Ordering is closed for this week.'; render(); return; }
     if (!state.paidCheckbox) { state.orderError = "Check the box once you've sent payment to Drew."; render(); return; }
     const items = state.menu.meals
       .filter(m => (state.qty[m.id] || 0) > 0)
@@ -632,6 +636,33 @@
   function addDraftMeal() { state.draftMenu.meals = [...state.draftMenu.meals, emptyMeal()]; scheduleAutosave(); render(); }
   function removeDraftMeal(id) { state.draftMenu.meals = state.draftMenu.meals.filter(m => m.id !== id); scheduleAutosave(); render(); }
 
+  async function toggleOrderingOpen() {
+    const updated = { ...state.menu, orderingOpen: !state.menu.orderingOpen };
+    try {
+      const result = await window.storage.set('menu', JSON.stringify(updated));
+      if (!result) throw new Error('save failed');
+      state.menu = updated;
+      state.draftMenu = { ...state.draftMenu, orderingOpen: updated.orderingOpen };
+      render();
+    } catch (e) {
+      alert('Could not update ordering status. Please try again.');
+    }
+  }
+
+  async function clearPublishedMenu() {
+    const proceed = confirm(`Clear the menu customers currently see? They'll see "no meals posted yet" until you publish again. This won't touch what you're editing below.`);
+    if (!proceed) return;
+    try {
+      const cleared = { ...state.menu, meals: [] };
+      const result = await window.storage.set('menu', JSON.stringify(cleared));
+      if (!result) throw new Error('save failed');
+      state.menu = cleared;
+      render();
+    } catch (e) {
+      alert('Could not clear the menu. Please try again.');
+    }
+  }
+
   async function publishMenu() {
     const named = state.draftMenu.meals.filter(m => m.name.trim() !== '');
     const missing = named.filter(m => !m.price).length;
@@ -746,7 +777,8 @@
     if (state.confirmed) return renderConfirmation();
 
     const meals = state.menu.meals;
-    const sc = selectedCount();
+    const orderingOpen = state.menu.orderingOpen !== false;
+    const sc = orderingOpen ? selectedCount() : 0;
     const td = totalDue();
 
     const mealCards = meals.length === 0
@@ -766,17 +798,26 @@
                   <span class="mono" style="font-size:14px;color:var(--rust);white-space:nowrap;">$${(parseFloat(m.price) || 0).toFixed(2)}</span>
                 </div>
                 ${m.description ? `<p style="font-size:12.5px;color:var(--inkSoft);margin:0;line-height:1.4;">${escapeHtml(m.description)}</p>` : ''}
-                <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
-                  <button class="stepper-btn" onclick="changeQty('${m.id}',-1)" aria-label="Remove one ${escapeHtml(m.name)}">−</button>
-                  <span class="mono" style="min-width:18px;text-align:center;font-size:14px;">${state.qty[m.id] || 0}</span>
-                  <button class="stepper-btn add" onclick="changeQty('${m.id}',1)" aria-label="Add one ${escapeHtml(m.name)}">+</button>
-                </div>
+                ${orderingOpen ? `
+                  <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                    <button class="stepper-btn" onclick="changeQty('${m.id}',-1)" aria-label="Remove one ${escapeHtml(m.name)}">−</button>
+                    <span class="mono" style="min-width:18px;text-align:center;font-size:14px;">${state.qty[m.id] || 0}</span>
+                    <button class="stepper-btn add" onclick="changeQty('${m.id}',1)" aria-label="Add one ${escapeHtml(m.name)}">+</button>
+                  </div>
+                ` : ''}
               </div>
             </div>
           `).join('')}
         </div>`;
 
-    const ticket = sc > 0 ? `
+    const closedBanner = !orderingOpen ? `
+      <div style="margin:0 16px 16px;background:var(--paperDim);border:1px solid var(--line);border-radius:10px;padding:12px 16px;text-align:center;">
+        <span style="font-size:13px;color:var(--rust);font-weight:600;">🔒 Ordering is closed for this week</span>
+        <p style="margin:4px 0 0;font-size:12.5px;color:var(--inkSoft);">Check back once Drew reopens it.</p>
+      </div>
+    ` : '';
+
+    const ticket = (orderingOpen && sc > 0) ? `
       <div style="position:fixed;left:0;right:0;bottom:0;max-width:640px;margin:0 auto;">
         <div class="ticket-edge"></div>
         <div style="background:var(--ink);color:var(--paper);padding:14px 20px 18px;">
@@ -814,6 +855,7 @@
           <p class="mono" style="font-size:13px;color:var(--rust);letter-spacing:1px;text-transform:uppercase;margin:0;">${escapeHtml(state.menu.weekLabel || 'Menu coming soon')}</p>
         </header>
         ${mealCards}
+        ${closedBanner}
         <div style="padding:28px 24px 8px;"></div>
         ${ticket}
       </div>
@@ -996,6 +1038,18 @@
           </div>
         </div>
 
+        <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+          <div>
+            <label class="label" style="margin-bottom:2px;">Ordering status</label>
+            <p style="margin:0;font-size:14px;font-weight:600;color:${state.menu.orderingOpen !== false ? 'var(--basil)' : 'var(--rust)'};">
+              ${state.menu.orderingOpen !== false ? '🔓 Open — customers can order' : '🔒 Closed — customers cannot order'}
+            </p>
+          </div>
+          <button class="btn-primary" style="width:auto;padding:10px 16px;white-space:nowrap;background:${state.menu.orderingOpen !== false ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleOrderingOpen()">
+            ${state.menu.orderingOpen !== false ? 'Close ordering' : 'Open ordering'}
+          </button>
+        </div>
+
         <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 6px;">Drop in this week's menu</h2>
         <p style="font-size:12.5px;color:var(--inkSoft);margin:0 0 10px;">
           Fill out <a href="Weekly_Meal_Menu_Template.docx" download style="color:var(--basil);">the weekly template</a>, then drag it in below.
@@ -1039,9 +1093,10 @@
         <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">${mealCards}</div>
 
         <button class="btn-ghost" onclick="addDraftMeal()" style="margin-bottom:20px;">+ Add a meal</button>
-        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:36px;" ${state.saving ? 'disabled' : ''}>
+        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:12px;" ${state.saving ? 'disabled' : ''}>
           ${state.saving ? 'Saving…' : 'Save & publish menu'}
         </button>
+        <button class="btn-ghost" onclick="clearPublishedMenu()" style="margin-bottom:36px;color:var(--rust);">🧹 Clear customer-facing menu</button>
 
         <div style="border-top:1px solid var(--line);padding-top:24px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
