@@ -68,6 +68,10 @@
   const SUPABASE_URL = 'https://crufaonqcxodsghirrwc.supabase.co';
   const SUPABASE_KEY = 'sb_publishable_EWI9uKlSAgMWnor_H4Z_TQ_ITMizzeO';
   const REST = `${SUPABASE_URL}/rest/v1/kv_store`;
+  // Public half of the notification key pair — safe to expose client-side, same as the
+  // Supabase key above. The matching private key lives only as a Supabase Edge Function
+  // secret and is never in this file.
+  const VAPID_PUBLIC_KEY = 'BArw1Sv07yDNxLn9bb8rH03asaWuTBuEd2HF_bO0NR3PPkqLlwmq-wD1OitT4lvUkELx3t1ZOpHeFIHCjna75mM';
   function sbHeaders(extra) {
     return { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'application/json', ...extra };
   }
@@ -110,7 +114,6 @@
   };
 
   const DREW_VENMO = 'Andrew-Dzib-Galvan';
-  const DELIVERY_FEE = 5;
   const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
 
   let state = {
@@ -121,7 +124,6 @@
     auth: { pin: '2468', question: '', answer: '' },
     qty: {},
     customerName: '',
-    wantsDelivery: false,
     paymentStep: false,
     paidCheckbox: false,
     submitting: false,
@@ -130,6 +132,10 @@
     pinInput: '',
     pinError: false,
     forgotMode: false,
+    pushSubscribed: false,
+    pushPermission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
+    pushPromptDismissed: localStorage.getItem('dk_push_dismissed') === '1',
+    pushBusy: false,
     forgotAnswer: '',
     forgotError: '',
     forgotUnlocked: false,
@@ -359,11 +365,8 @@
   }
 
   // ---------- derived ----------
-  function mealsSubtotal() {
-    return state.menu.meals.reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
-  }
   function totalDue() {
-    return mealsSubtotal() + (state.wantsDelivery ? DELIVERY_FEE : 0);
+    return state.menu.meals.reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
   }
   function selectedCount() {
     return Object.values(state.qty).reduce((a, b) => a + b, 0);
@@ -381,7 +384,6 @@
   }
 
   function setCustomerName(v) { state.customerName = v; }
-  function setWantsDelivery(v) { state.wantsDelivery = v; render(); }
   function setPinInput(v) { state.pinInput = v; state.pinError = false; }
   function setPasteText(v) { state.pasteText = v; }
   function setWeekLabel(v) { state.draftMenu.weekLabel = v; scheduleAutosave(); }
@@ -419,7 +421,6 @@
       const orderId = 'o' + Date.now() + Math.random().toString(36).slice(2, 6);
       const order = {
         customerName: state.customerName.trim(), items, total: totalDue(), timestamp: Date.now(),
-        delivery: !!state.wantsDelivery,
         customerConfirmedPaid: true, paidConfirmed: false,
       };
       const result = await window.storage.set(`order:${state.menu.weekLabel}:${orderId}`, JSON.stringify(order));
@@ -427,7 +428,6 @@
       state.confirmed = order;
       state.paymentStep = false;
       state.paidCheckbox = false;
-      state.wantsDelivery = false;
     } catch (e) {
       state.orderError = 'Something went wrong sending your order. Please try again.';
     }
@@ -439,24 +439,6 @@
   }
   function venmoWebFallback() {
     return `https://venmo.com/u/${encodeURIComponent(DREW_VENMO)}`;
-  }
-
-  function buildOrderSummaryText(order) {
-    const lines = [];
-    lines.push(`Drew's Kitchen — ${state.menu.weekLabel}`);
-    lines.push('');
-    order.items.forEach(it => lines.push(`${it.qty} × ${it.name} — $${(it.qty * it.price).toFixed(2)}`));
-    if (order.delivery) lines.push(`Delivery — $${DELIVERY_FEE.toFixed(2)}`);
-    lines.push('');
-    lines.push(`TOTAL: $${order.total.toFixed(2)}`);
-    return lines.join('\n');
-  }
-  function isIOS() {
-    return /iPhone|iPad|iPod/i.test(navigator.userAgent);
-  }
-  function smsHref(body) {
-    const sep = isIOS() ? '&' : '?';
-    return `sms:${sep}body=${encodeURIComponent(body)}`;
   }
 
   async function enterKitchenView() {
@@ -670,6 +652,7 @@
       state.menu = updated;
       state.draftMenu = { ...state.draftMenu, orderingOpen: updated.orderingOpen };
       render();
+      notifyStatusChange(updated.orderingOpen ? 'open' : 'close', updated.weekLabel);
     } catch (e) {
       alert('Could not update ordering status. Please try again.');
     }
@@ -725,10 +708,10 @@
   }
 
   function exportCSV() {
-    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed', 'Delivery']];
+    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed']];
     state.orders.forEach(o => {
-      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '', '']));
-      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No', o.delivery ? 'Yes' : 'No']);
+      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '']));
+      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No']);
     });
     const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -772,7 +755,7 @@
   function openKitchen() { state.view = 'pinGate'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function exitKitchen() { state.view = 'order'; render(); }
-  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.wantsDelivery = false; state.paymentStep = false; state.paidCheckbox = false; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
   async function togglePaidConfirmed(key) {
@@ -790,13 +773,96 @@
     }
   }
 
-  // ---------- render ----------
+  // ---------- push notifications ----------
+  async function initPush() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.register('sw.js');
+      const sub = await reg.pushManager.getSubscription();
+      state.pushSubscribed = !!sub;
+      render();
+    } catch (e) {
+      // Non-critical — notifications just won't be available this session.
+    }
+  }
+
+  function urlBase64ToUint8Array(base64String) {
+    const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+    const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+    const rawData = atob(base64);
+    const arr = new Uint8Array(rawData.length);
+    for (let i = 0; i < rawData.length; i++) arr[i] = rawData.charCodeAt(i);
+    return arr;
+  }
+
+  async function hashEndpoint(endpoint) {
+    const enc = new TextEncoder().encode(endpoint);
+    const buf = await crypto.subtle.digest('SHA-256', enc);
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('').slice(0, 32);
+  }
+
+  async function enableNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Notifications aren't supported on this browser/device.");
+      return;
+    }
+    state.pushBusy = true; render();
+    try {
+      const permission = await Notification.requestPermission();
+      state.pushPermission = permission;
+      if (permission !== 'granted') { state.pushBusy = false; render(); return; }
+
+      const reg = await navigator.serviceWorker.register('sw.js');
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      const subId = await hashEndpoint(sub.endpoint);
+      const result = await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
+      if (!result) throw new Error('save failed');
+      state.pushSubscribed = true;
+    } catch (e) {
+      alert('Could not enable notifications. Please try again.');
+    }
+    state.pushBusy = false;
+    render();
+  }
+
+  function dismissPushPrompt() {
+    state.pushPromptDismissed = true;
+    localStorage.setItem('dk_push_dismissed', '1');
+    render();
+  }
+
+  async function notifyStatusChange(eventType, weekLabel) {
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: eventType, weekLabel }),
+      });
+    } catch (e) {
+      // Best-effort — never block Drew's open/close toggle on a push failure.
+    }
+  }
+
   function render() {
     const app = document.getElementById('app');
     if (state.loading) { app.innerHTML = '<div class="loading">Loading…</div>'; return; }
     if (state.view === 'order') app.innerHTML = renderOrderView();
     else if (state.view === 'pinGate') app.innerHTML = renderPinGate();
     else if (state.view === 'kitchen') app.innerHTML = renderKitchenView();
+    requestAnimationFrame(sizeBottomSpacer);
+  }
+
+  function sizeBottomSpacer() {
+    const bar = document.getElementById('ticketBar');
+    const spacer = document.getElementById('bottomSpacer');
+    if (!spacer) return;
+    spacer.style.height = bar ? (bar.offsetHeight + 16) + 'px' : '0px';
   }
 
   function renderOrderView() {
@@ -806,6 +872,21 @@
     const orderingOpen = state.menu.orderingOpen !== false;
     const sc = orderingOpen ? selectedCount() : 0;
     const td = totalDue();
+
+    const pushSupported = ('serviceWorker' in navigator) && ('PushManager' in window);
+    const pushBanner = state.pushSubscribed
+      ? `<div style="margin:0 16px 12px;"><span class="mono" style="font-size:11px;color:var(--basil);">🔔 Notifications on</span></div>`
+      : (pushSupported && state.pushPermission !== 'denied' && !state.pushPromptDismissed) ? `
+        <div style="margin:0 16px 16px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+          <div>
+            <p style="margin:0;font-size:13px;font-weight:600;">🔔 Get notified</p>
+            <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">Know the moment ordering opens or closes.</p>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn-ghost" onclick="dismissPushPrompt()" style="font-size:11px;padding:6px 10px;">No thanks</button>
+            <button class="btn-primary" style="width:auto;padding:8px 12px;font-size:12px;" ${state.pushBusy ? 'disabled' : ''} onclick="enableNotifications()">${state.pushBusy ? '…' : 'Enable'}</button>
+          </div>
+        </div>` : '';
 
     const mealCards = meals.length === 0
       ? `<div style="text-align:center;padding:60px 24px;color:var(--inkSoft);">No meals posted yet this week. Check back soon.</div>`
@@ -844,29 +925,20 @@
     ` : '';
 
     const ticket = (orderingOpen && sc > 0) ? `
-      <div style="position:fixed;left:0;right:0;bottom:0;max-width:640px;margin:0 auto;">
+      <div id="ticketBar" style="position:fixed;left:0;right:0;bottom:0;max-width:640px;margin:0 auto;">
         <div class="ticket-edge"></div>
         <div style="background:var(--ink);color:var(--paper);padding:14px 20px 18px;">
-          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:${state.wantsDelivery ? 2 : 10}px;">
+          <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:10px;">
             <span class="mono" style="font-size:12px;color:#D9AFC0;">${sc} meal${sc !== 1 ? 's' : ''} selected</span>
             <span class="mono" style="font-size:18px;font-weight:600;">$${td.toFixed(2)}</span>
           </div>
-          ${state.wantsDelivery ? `
-            <div style="display:flex;justify-content:space-between;margin-bottom:10px;">
-              <span class="mono" style="font-size:11px;color:#C79AAE;">meals $${mealsSubtotal().toFixed(2)} + delivery $${DELIVERY_FEE.toFixed(2)}</span>
-            </div>
-          ` : ''}
           ${!state.paymentStep ? `
             <input class="field" style="margin-bottom:8px;background:#4F2438;color:#fff;border-color:#6B3550;" placeholder="Your name"
               value="${escapeHtml(state.customerName)}" oninput="setCustomerName(this.value)">
-            <label style="display:flex;align-items:center;gap:8px;font-size:13px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
-              <input type="checkbox" ${state.wantsDelivery ? 'checked' : ''} onchange="setWantsDelivery(this.checked)">
-              <span>🚚 Deliver my order (+$${DELIVERY_FEE.toFixed(2)})</span>
-            </label>
             ${state.orderError ? `<p style="color:var(--butter);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.orderError)}</p>` : ''}
             <button class="btn-primary" onclick="goToPayment()">Continue to payment</button>
           ` : `
-            <p style="font-size:12.5px;color:#D9AFC0;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong>${state.wantsDelivery ? ` (includes $${DELIVERY_FEE.toFixed(2)} delivery)` : ''} to Drew, then check the box below to send your order.</p>
+            <p style="font-size:12.5px;color:#D9AFC0;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong> to Drew, then check the box below to send your order.</p>
             <a class="venmo-link" href="${venmoHref(td, `${state.menu.weekLabel} — ${state.customerName.trim()}`)}"><button class="btn-primary" style="background:#3D95CE;margin-bottom:6px;" type="button">Pay $${td.toFixed(2)} with Venmo</button></a>
             <p style="font-size:11.5px;color:#C79AAE;margin:0 0 10px;line-height:1.4;">On a computer? That button only opens the Venmo app on a phone. Instead, send <strong style="color:#D9AFC0;">$${td.toFixed(2)}</strong> to <strong style="color:#D9AFC0;">@${DREW_VENMO}</strong> with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(state.customerName.trim())}" via the Venmo app or <a href="${venmoWebFallback()}" style="color:#F5A9C7;">${venmoWebFallback()}</a>.</p>
             <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
@@ -889,9 +961,10 @@
           <h1 class="display" style="font-size:28px;font-weight:700;margin:8px 0 2px;">Drew's Kitchen</h1>
           <p class="mono" style="font-size:13px;color:var(--rust);letter-spacing:1px;text-transform:uppercase;margin:0;">${escapeHtml(state.menu.weekLabel || 'Menu coming soon')}</p>
         </header>
+        ${pushBanner}
         ${mealCards}
         ${closedBanner}
-        <div style="padding:28px 24px 8px;"></div>
+        <div id="bottomSpacer" style="height:24px;"></div>
         ${ticket}
       </div>
     `;
@@ -913,20 +986,11 @@
         </div>
         <div style="background:#fff;border:1px dashed var(--line);border-radius:10px;padding:16px 18px;">
           ${receiptRows}
-          ${c.delivery ? `
-            <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;color:var(--rust);">
-              <span>🚚 Delivery</span><span>$${DELIVERY_FEE.toFixed(2)}</span>
-            </div>` : ''}
           <div style="border-top:1px solid var(--line);margin-top:8px;padding-top:8px;display:flex;justify-content:space-between;">
             <span class="mono" style="font-weight:600;font-size:13px;">TOTAL</span>
             <span class="mono" style="font-weight:600;font-size:13px;">$${c.total.toFixed(2)}</span>
           </div>
         </div>
-        ${c.delivery ? `<p style="font-size:12.5px;color:var(--rust);text-align:center;margin-top:12px;font-weight:600;">🚚 Delivery requested — Drew will drop this off.</p>` : ''}
-        <a href="${smsHref(buildOrderSummaryText(c))}" style="text-decoration:none;display:block;margin-top:16px;">
-          <button class="btn-ghost" style="width:100%;justify-content:center;">📱 Text me my order</button>
-        </a>
-        <p style="font-size:11px;color:var(--inkSoft);text-align:center;margin-top:6px;">On a computer? This only opens a texting app on a phone — screenshot this page instead.</p>
         <p style="font-size:12px;color:var(--inkSoft);text-align:center;margin-top:16px;">
           Didn't finish sending payment yet? Send <strong>$${c.total.toFixed(2)}</strong> to <strong>@${DREW_VENMO}</strong>
           with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}" — or visit
@@ -1023,10 +1087,7 @@
           ${state.orders.map(o => `
             <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;">
               <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                <div style="display:flex;align-items:center;gap:8px;">
-                  <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
-                  ${o.delivery ? `<span class="mono" style="font-size:10.5px;background:var(--paperDim);color:var(--rust);border-radius:6px;padding:2px 6px;font-weight:600;">🚚 DELIVERY</span>` : ''}
-                </div>
+                <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
                 <div style="display:flex;align-items:center;gap:10px;">
                   <span class="mono" style="font-size:14px;color:var(--rust);">$${o.total.toFixed(2)}</span>
                   <button class="btn-icon" style="color:var(--inkSoft);" onclick="deleteOrder('${o.key}')">✕</button>
@@ -1064,7 +1125,6 @@
                   <div style="background:#FDF7F9;border:1px dashed var(--line);border-radius:10px;padding:10px 12px;display:flex;justify-content:space-between;align-items:center;">
                     <div>
                       <strong style="font-size:13px;">${escapeHtml(o.customerName)}</strong>
-                      ${o.delivery ? `<span class="mono" style="font-size:10px;color:var(--rust);margin-left:6px;">🚚</span>` : ''}
                       <span class="mono" style="font-size:12px;color:var(--inkSoft);margin-left:8px;">$${o.total.toFixed(2)}</span>
                     </div>
                     <button class="btn-ghost" onclick="restoreOrder('${o.key}')" style="font-size:11px;">↺ Restore</button>
@@ -1177,8 +1237,11 @@
     `;
   }
 
+  window.addEventListener('resize', sizeBottomSpacer);
+
   loadAuth();
   loadMenu();
+  initPush();
 </script>
 </body>
 </html>
