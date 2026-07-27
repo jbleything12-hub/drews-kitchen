@@ -364,6 +364,31 @@
     render();
   }
 
+  // ---------- keep ordering-open status live for browsing customers ----------
+  // Only updates state.menu.orderingOpen — never touches meals/weekLabel, so it can't
+  // disrupt someone's in-progress selections. Stops checking entirely once someone has
+  // continued to the payment step or already submitted, so a mid-checkout customer isn't
+  // retroactively blocked if Drew closes ordering while they're finishing up.
+  let menuPollTimer = null;
+  function startMenuPoll() {
+    if (menuPollTimer) return;
+    menuPollTimer = setInterval(async () => {
+      if (state.view !== 'order' || state.paymentStep || state.confirmed) return;
+      try {
+        const res = await window.storage.get('menu');
+        if (!res || !res.value) return;
+        const fresh = JSON.parse(res.value);
+        const freshOpen = typeof fresh.orderingOpen === 'boolean' ? fresh.orderingOpen : true;
+        if (freshOpen !== state.menu.orderingOpen) {
+          state.menu = { ...state.menu, orderingOpen: freshOpen };
+          render();
+        }
+      } catch (e) {
+        // Best-effort — keep showing the last known status rather than erroring out.
+      }
+    }, 20000);
+  }
+
   async function loadAuth() {
     try {
       const res = await window.storage.get('kitchenAuth');
@@ -387,6 +412,33 @@
       state.orders = [];
     }
     state.ordersLoading = false; render();
+  }
+
+  // ---------- keep Drew's orders list live without a manual refresh ----------
+  // Silent — doesn't toggle state.ordersLoading (no spinner flash) and only re-renders
+  // if the order list actually changed, so it doesn't interrupt anything Drew's doing.
+  let ordersPollTimer = null;
+  function startOrdersPoll() {
+    if (ordersPollTimer) return;
+    ordersPollTimer = setInterval(async () => {
+      if (state.view !== 'kitchen' || !state.draftMenu || !state.draftMenu.weekLabel) return;
+      try {
+        const weekLabel = state.draftMenu.weekLabel;
+        const list = await window.storage.list(`order:${weekLabel}:`);
+        const keys = (list && list.keys) || [];
+        const results = await Promise.all(keys.map(async k => {
+          try { const r = await window.storage.get(k); return r ? { key: k, ...JSON.parse(r.value) } : null; }
+          catch { return null; }
+        }));
+        const fresh = results.filter(Boolean).sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+        if (JSON.stringify(fresh) !== JSON.stringify(state.orders)) {
+          state.orders = fresh;
+          render();
+        }
+      } catch (e) {
+        // Best-effort — keep showing the last known orders rather than erroring out.
+      }
+    }, 15000);
   }
 
   // ---------- derived ----------
@@ -1555,7 +1607,7 @@
         <div style="border-top:1px solid var(--line);padding-top:24px;">
           <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px;">
             <h2 class="display" style="font-size:22px;font-weight:600;margin:0;">Orders — ${escapeHtml(state.menu.weekLabel)}</h2>
-            <button class="btn-icon" onclick="reloadOrders()">🧾</button>
+            <button class="btn-ghost" onclick="reloadOrders()" title="Manually refresh the orders list" style="font-size:12px;">🧾 Refresh</button>
           </div>
           ${ordersHtml}
           <div style="margin-top:16px;">${archivedHtml}</div>
@@ -1625,6 +1677,8 @@
   loadAuth();
   loadMenu();
   initPush();
+  startMenuPoll();
+  startOrdersPoll();
 </script>
 </body>
 </html>
