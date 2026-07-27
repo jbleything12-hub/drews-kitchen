@@ -155,8 +155,6 @@
     showInstallModal: false,
     drewPushSubscribed: false,
     drewPushBusy: false,
-    orderPushSubscribed: false,
-    orderPushBusy: false,
     testMode: false,
     testPushSubscribed: false,
     testPushBusy: false,
@@ -507,6 +505,7 @@
       state.paymentStep = false;
       state.paidCheckbox = false;
       notifyNewOrder(order.customerName, order.total, state.menu.weekLabel);
+      linkOrderToExistingSubscription(order.weekLabel, order.orderId);
     } catch (e) {
       state.orderError = 'Something went wrong sending your order. Please try again.';
     }
@@ -837,7 +836,7 @@
   function openKitchen() { state.view = 'pinGate'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function exitKitchen() { state.view = 'order'; render(); }
-  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; state.orderPushSubscribed = false; state.orderPushBusy = false; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
   async function togglePaidConfirmed(key) {
@@ -910,11 +909,32 @@
       const result = await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
       if (!result) throw new Error('save failed');
       state.pushSubscribed = true;
+      // If they're enabling this from the order confirmation screen (rather than
+      // while just browsing), also link this same subscription to that order —
+      // one "Enable" covers both ordering open/close and this order's payment confirmation.
+      if (state.confirmed && state.confirmed.weekLabel && state.confirmed.orderId) {
+        await window.storage.set(`orderPushSub:${state.confirmed.weekLabel}:${state.confirmed.orderId}`, JSON.stringify(sub));
+      }
     } catch (e) {
       alert('Could not enable notifications. Please try again.');
     }
     state.pushBusy = false;
     render();
+  }
+
+  // If someone already has notifications enabled from an earlier visit, silently
+  // attach that same subscription to each new order they place — no separate prompt
+  // needed for the payment-confirmed notification.
+  async function linkOrderToExistingSubscription(weekLabel, orderId) {
+    if (!state.pushSubscribed || !('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration('sw.js');
+      const sub = reg && await reg.pushManager.getSubscription();
+      if (!sub) return;
+      await window.storage.set(`orderPushSub:${weekLabel}:${orderId}`, JSON.stringify(sub));
+    } catch (e) {
+      // Best-effort — never block order confirmation on this.
+    }
   }
 
   function dismissPushPrompt() {
@@ -1127,36 +1147,9 @@
   // ---------- per-customer "payment confirmed" notifications ----------
   // Each order can have at most one subscription, stored under
   // orderPushSub:{weekLabel}:{orderId} — separate from both the broadcast
-  // customer subscriptions and Drew's own drewPushSub: subscriptions.
-  async function enableOrderNotifications() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      alert("Notifications aren't supported on this browser/device.");
-      return;
-    }
-    if (!state.confirmed || !state.confirmed.orderId) return;
-    state.orderPushBusy = true; render();
-    try {
-      const permission = await Notification.requestPermission();
-      if (permission !== 'granted') { state.orderPushBusy = false; render(); return; }
-      const reg = await navigator.serviceWorker.register('sw.js');
-      let sub = await reg.pushManager.getSubscription();
-      if (!sub) {
-        sub = await reg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
-        });
-      }
-      const orderKey = `${state.confirmed.weekLabel}:${state.confirmed.orderId}`;
-      const result = await window.storage.set(`orderPushSub:${orderKey}`, JSON.stringify(sub));
-      if (!result) throw new Error('save failed');
-      state.orderPushSubscribed = true;
-    } catch (e) {
-      alert('Could not enable notifications. Please try again.');
-    }
-    state.orderPushBusy = false;
-    render();
-  }
-
+  // customer subscriptions and Drew's own drewPushSub: subscriptions. Linked
+  // automatically (see enableNotifications / linkOrderToExistingSubscription above)
+  // rather than through a separate opt-in on the confirmation screen.
   async function notifyPaymentConfirmed(weekLabel, orderId) {
     try {
       await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
@@ -1241,7 +1234,7 @@
         <div style="margin:0 16px 16px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
           <div>
             <p style="margin:0;font-size:13px;font-weight:600;">🔔 Get notified</p>
-            <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">Know the moment ordering opens or closes.</p>
+            <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">Know the moment ordering opens or closes, and when Drew confirms your payment.</p>
           </div>
           <div style="display:flex;gap:6px;">
             <button class="btn-ghost" onclick="dismissPushPrompt()" style="font-size:11px;padding:6px 10px;">No thanks</button>
@@ -1359,10 +1352,10 @@
       </div>`).join('');
 
     const orderPushSupported = ('serviceWorker' in navigator) && ('PushManager' in window);
-    const orderPushBlock = !orderPushSupported ? '' : state.orderPushSubscribed
+    const orderPushBlock = !orderPushSupported ? '' : state.pushSubscribed
       ? `<p class="mono" style="font-size:11px;color:var(--basil);text-align:center;margin-top:16px;">🔔 We'll notify you when Drew confirms your payment</p>`
       : `<div style="text-align:center;margin-top:16px;">
-          <button class="btn-ghost" ${state.orderPushBusy ? 'disabled' : ''} onclick="enableOrderNotifications()" style="font-size:12.5px;">${state.orderPushBusy ? '…' : '🔔 Notify me when payment is confirmed'}</button>
+          <button class="btn-ghost" ${state.pushBusy ? 'disabled' : ''} onclick="enableNotifications()" style="font-size:12.5px;">${state.pushBusy ? '…' : '🔔 Enable notifications for payment confirmation'}</button>
         </div>`;
 
     return `
