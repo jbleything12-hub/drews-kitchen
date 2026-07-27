@@ -149,6 +149,8 @@
     pushPermission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
     pushPromptDismissed: localStorage.getItem('dk_push_dismissed') === '1',
     pushBusy: false,
+    notifBroken: false,
+    notifBrokenDismissed: localStorage.getItem('dk_notif_broken_dismissed') === '1',
     installPlatform: detectInstallPlatform(),
     installStandalone: isRunningStandalone(),
     installBannerDismissed: localStorage.getItem('dk_install_dismissed') === '1',
@@ -381,6 +383,7 @@
           state.menu = { ...state.menu, orderingOpen: freshOpen };
           render();
         }
+        checkNotificationHealth();
       } catch (e) {
         // Best-effort — keep showing the last known status rather than erroring out.
       }
@@ -909,6 +912,7 @@
       const result = await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
       if (!result) throw new Error('save failed');
       state.pushSubscribed = true;
+      localStorage.setItem('dk_notif_ever_enabled', '1');
       // If they're enabling this from the order confirmation screen (rather than
       // while just browsing), also link this same subscription to that order —
       // one "Enable" covers both ordering open/close and this order's payment confirmation.
@@ -941,6 +945,66 @@
     state.pushPromptDismissed = true;
     localStorage.setItem('dk_push_dismissed', '1');
     render();
+  }
+
+  function dismissNotifBroken() {
+    state.notifBrokenDismissed = true;
+    localStorage.setItem('dk_notif_broken_dismissed', '1');
+    render();
+  }
+
+  // ---------- notification health check ----------
+  // Runs quietly in the background (see startMenuPoll). Two kinds of problems:
+  //   1. Fixable without bothering anyone: permission is still granted, but either the
+  //      browser subscription itself or our server's copy of it got lost somehow (site
+  //      data cleared, PWA reinstalled, our own stale-subscription cleanup ran, etc).
+  //      These just get silently repaired.
+  //   2. Not fixable by us: permission was actively revoked (browser/OS setting). JS can't
+  //      re-prompt once denied — only the person can flip it back on. Only worth mentioning
+  //      to someone who'd previously enabled notifications, so it's never shown to people
+  //      who never opted in in the first place.
+  async function checkNotificationHealth() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
+    const permission = Notification.permission;
+    state.pushPermission = permission;
+
+    if (permission === 'denied') {
+      const everEnabled = localStorage.getItem('dk_notif_ever_enabled') === '1';
+      state.pushSubscribed = false;
+      state.notifBroken = everEnabled;
+      render();
+      return;
+    }
+
+    try {
+      const reg = await navigator.serviceWorker.getRegistration('sw.js');
+      let sub = reg && await reg.pushManager.getSubscription();
+
+      if (!sub && permission === 'granted' && localStorage.getItem('dk_notif_ever_enabled') === '1') {
+        // Permission's still granted but the subscription itself is gone — re-subscribe
+        // silently, no prompt needed since permission was already granted.
+        const freshReg = reg || await navigator.serviceWorker.register('sw.js');
+        sub = await freshReg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+
+      if (!sub) return; // never subscribed on this device — nothing to repair
+
+      const subId = await hashEndpoint(sub.endpoint);
+      const res = await window.storage.get(`pushSub:${subId}`);
+      if (!res || !res.value) {
+        // Server's copy is gone (e.g. our own cleanup removed it after a failed send)
+        // even though the browser still has it — silently re-save it.
+        await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
+      }
+      state.pushSubscribed = true;
+      state.notifBroken = false;
+      render();
+    } catch (e) {
+      // Best-effort — try again next poll rather than surfacing an error.
+    }
   }
 
   // ---------- Add to Home Screen ----------
@@ -1242,6 +1306,15 @@
           </div>
         </div>` : '';
 
+    const notifBrokenBanner = (state.notifBroken && !state.notifBrokenDismissed) ? `
+      <div style="margin:0 16px 16px;background:#FFF3CD;border:1px solid #E8A33D;border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+        <div>
+          <p style="margin:0;font-size:13px;font-weight:600;color:#7A5100;">🔕 Notifications are off</p>
+          <p style="margin:2px 0 0;font-size:12px;color:#7A5100;">Looks like notifications got turned off in your phone or browser's settings. Check your notification settings for this site to turn them back on.</p>
+        </div>
+        <button class="btn-ghost" onclick="dismissNotifBroken()" style="font-size:11px;padding:6px 10px;white-space:nowrap;background:#fff;">Got it</button>
+      </div>` : '';
+
     const showInstallUI = !state.installStandalone;
     const installBanner = (showInstallUI && !state.installBannerDismissed) ? `
       <div style="margin:0 16px 12px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -1334,6 +1407,7 @@
         </header>
         ${installButton}
         ${pushBanner}
+        ${notifBrokenBanner}
         ${installBanner}
         ${mealCards}
         ${closedBanner}
