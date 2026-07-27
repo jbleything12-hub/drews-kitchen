@@ -116,6 +116,19 @@
   const DREW_VENMO = 'Andrew-Dzib-Galvan';
   const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
 
+  // ---------- Add to Home Screen detection ----------
+  function detectInstallPlatform() {
+    const ua = navigator.userAgent || '';
+    const isIOS = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (isIOS) return 'ios';
+    if (/Android/.test(ua)) return 'android';
+    return 'other';
+  }
+  function isRunningStandalone() {
+    return (typeof window.matchMedia === 'function' && window.matchMedia('(display-mode: standalone)').matches)
+      || window.navigator.standalone === true;
+  }
+
   let state = {
     loading: true,
     view: 'order', // order | pinGate | kitchen
@@ -136,6 +149,14 @@
     pushPermission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
     pushPromptDismissed: localStorage.getItem('dk_push_dismissed') === '1',
     pushBusy: false,
+    installPlatform: detectInstallPlatform(),
+    installStandalone: isRunningStandalone(),
+    installBannerDismissed: localStorage.getItem('dk_install_dismissed') === '1',
+    showInstallModal: false,
+    drewPushSubscribed: false,
+    drewPushBusy: false,
+    orderPushSubscribed: false,
+    orderPushBusy: false,
     forgotAnswer: '',
     forgotError: '',
     forgotUnlocked: false,
@@ -422,12 +443,14 @@
       const order = {
         customerName: state.customerName.trim(), items, total: totalDue(), timestamp: Date.now(),
         customerConfirmedPaid: true, paidConfirmed: false,
+        weekLabel: state.menu.weekLabel, orderId,
       };
       const result = await window.storage.set(`order:${state.menu.weekLabel}:${orderId}`, JSON.stringify(order));
       if (!result) throw new Error('save failed');
       state.confirmed = order;
       state.paymentStep = false;
       state.paidCheckbox = false;
+      notifyNewOrder(order.customerName, order.total, state.menu.weekLabel);
     } catch (e) {
       state.orderError = 'Something went wrong sending your order. Please try again.';
     }
@@ -456,6 +479,7 @@
       }
     } catch (e) { /* fall back to published menu already set as draft */ }
     loadOrders(state.draftMenu.weekLabel);
+    checkDrewPushStatus();
   }
 
   function tryPin() {
@@ -755,19 +779,23 @@
   function openKitchen() { state.view = 'pinGate'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function exitKitchen() { state.view = 'order'; render(); }
-  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; state.orderPushSubscribed = false; state.orderPushBusy = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
   async function togglePaidConfirmed(key) {
     const order = state.orders.find(o => o.key === key);
     if (!order) return;
-    const updated = { ...order, paidConfirmed: !order.paidConfirmed };
+    const newlyConfirmed = !order.paidConfirmed;
+    const updated = { ...order, paidConfirmed: newlyConfirmed };
     delete updated.key;
     try {
       const result = await window.storage.set(key, JSON.stringify(updated));
       if (!result) throw new Error('save failed');
       state.orders = state.orders.map(o => o.key === key ? { ...updated, key } : o);
       render();
+      if (newlyConfirmed && order.weekLabel && order.orderId) {
+        notifyPaymentConfirmed(order.weekLabel, order.orderId);
+      }
     } catch (e) {
       alert('Could not update payment status. Please try again.');
     }
@@ -837,6 +865,15 @@
     render();
   }
 
+  // ---------- Add to Home Screen ----------
+  function dismissInstallPrompt() {
+    state.installBannerDismissed = true;
+    localStorage.setItem('dk_install_dismissed', '1');
+    render();
+  }
+  function openInstallModal() { state.showInstallModal = true; render(); }
+  function closeInstallModal() { state.showInstallModal = false; render(); }
+
   async function notifyStatusChange(eventType, weekLabel) {
     try {
       await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
@@ -846,6 +883,128 @@
       });
     } catch (e) {
       // Best-effort — never block Drew's open/close toggle on a push failure.
+    }
+  }
+
+  // ---------- Drew's "new order" notifications ----------
+  // Stored under a separate drewPushSub: key prefix so Drew's own device(s) are
+  // never mixed in with the broadcast customer subscriptions (pushSub:).
+  async function checkDrewPushStatus() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { state.drewPushSubscribed = false; render(); return; }
+    try {
+      const reg = await navigator.serviceWorker.register('sw.js');
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) { state.drewPushSubscribed = false; render(); return; }
+      const subId = await hashEndpoint(sub.endpoint);
+      const res = await window.storage.get(`drewPushSub:${subId}`);
+      state.drewPushSubscribed = !!(res && res.value);
+    } catch (e) {
+      state.drewPushSubscribed = false;
+    }
+    render();
+  }
+
+  async function enableDrewNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Notifications aren't supported on this browser/device.");
+      return;
+    }
+    state.drewPushBusy = true; render();
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') { state.drewPushBusy = false; render(); return; }
+      const reg = await navigator.serviceWorker.register('sw.js');
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      const subId = await hashEndpoint(sub.endpoint);
+      const result = await window.storage.set(`drewPushSub:${subId}`, JSON.stringify(sub));
+      if (!result) throw new Error('save failed');
+      state.drewPushSubscribed = true;
+    } catch (e) {
+      alert('Could not enable notifications. Please try again.');
+    }
+    state.drewPushBusy = false;
+    render();
+  }
+
+  async function disableDrewNotifications() {
+    state.drewPushBusy = true; render();
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration('sw.js');
+        const sub = reg && await reg.pushManager.getSubscription();
+        if (sub) {
+          const subId = await hashEndpoint(sub.endpoint);
+          await window.storage.delete(`drewPushSub:${subId}`);
+        }
+      }
+      state.drewPushSubscribed = false;
+    } catch (e) {
+      alert('Could not turn off notifications. Please try again.');
+    }
+    state.drewPushBusy = false;
+    render();
+  }
+
+  async function notifyNewOrder(customerName, total, weekLabel) {
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'new_order', target: 'drew', customerName, total, weekLabel }),
+      });
+    } catch (e) {
+      // Best-effort — never block the customer's order confirmation on a push failure.
+    }
+  }
+
+  // ---------- per-customer "payment confirmed" notifications ----------
+  // Each order can have at most one subscription, stored under
+  // orderPushSub:{weekLabel}:{orderId} — separate from both the broadcast
+  // customer subscriptions and Drew's own drewPushSub: subscriptions.
+  async function enableOrderNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Notifications aren't supported on this browser/device.");
+      return;
+    }
+    if (!state.confirmed || !state.confirmed.orderId) return;
+    state.orderPushBusy = true; render();
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') { state.orderPushBusy = false; render(); return; }
+      const reg = await navigator.serviceWorker.register('sw.js');
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      const orderKey = `${state.confirmed.weekLabel}:${state.confirmed.orderId}`;
+      const result = await window.storage.set(`orderPushSub:${orderKey}`, JSON.stringify(sub));
+      if (!result) throw new Error('save failed');
+      state.orderPushSubscribed = true;
+    } catch (e) {
+      alert('Could not enable notifications. Please try again.');
+    }
+    state.orderPushBusy = false;
+    render();
+  }
+
+  async function notifyPaymentConfirmed(weekLabel, orderId) {
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'payment_confirmed', target: 'order', orderKey: `${weekLabel}:${orderId}`, weekLabel }),
+      });
+    } catch (e) {
+      // Best-effort — never block Drew's payment toggle on a push failure.
     }
   }
 
@@ -863,6 +1022,47 @@
     const spacer = document.getElementById('bottomSpacer');
     if (!spacer) return;
     spacer.style.height = bar ? (bar.offsetHeight + 16) + 'px' : '0px';
+  }
+
+  function renderInstallModal() {
+    if (!state.showInstallModal) return '';
+    const platform = state.installPlatform;
+    let title, steps, note;
+    if (platform === 'ios') {
+      title = 'Add to Home Screen (iPhone/iPad)';
+      steps = [
+        'Tap the <strong>Share</strong> icon (square with an arrow pointing up) at the bottom of Safari.',
+        'Scroll down and tap <strong>"Add to Home Screen."</strong>',
+        'Tap <strong>"Add"</strong> in the top right.',
+      ];
+      note = "Don't see a Share icon? This only works in Safari — if you opened this link inside Messages, Instagram, or another app, tap the ••• or browser icon first to open the page in Safari.";
+    } else if (platform === 'android') {
+      title = 'Add to Home Screen (Android)';
+      steps = [
+        'Tap the <strong>⋮ menu</strong> (three dots) in the top right of Chrome.',
+        'Tap <strong>"Add to Home screen"</strong> (it may say "Install app").',
+        'Tap <strong>"Add"</strong> or <strong>"Install"</strong> to confirm.',
+      ];
+      note = 'Using a different browser? Look for a similar "Add to Home screen" or "Install" option in its menu.';
+    } else {
+      title = 'Add to Home Screen';
+      steps = [
+        'Open this page on your phone (iPhone or Android) for one-tap setup.',
+        'On a computer, look for an install icon (⊕ or a small monitor) in your browser\'s address bar, or check the browser menu for "Install LuLu\'s Kitchen."',
+      ];
+      note = '';
+    }
+    return `
+      <div style="position:fixed;inset:0;background:rgba(59,27,43,0.5);display:flex;align-items:center;justify-content:center;z-index:1000;padding:20px;" onclick="if(event.target===this)closeInstallModal()">
+        <div style="background:#fff;border-radius:16px;padding:24px;max-width:380px;width:100%;">
+          <h2 class="display" style="font-size:19px;font-weight:600;margin:0 0 14px;">${title}</h2>
+          <ol style="margin:0 0 12px;padding-left:20px;font-size:14px;line-height:1.6;">
+            ${steps.map(s => `<li style="margin-bottom:8px;">${s}</li>`).join('')}
+          </ol>
+          ${note ? `<p style="font-size:12px;color:var(--inkSoft);margin:0 0 16px;line-height:1.4;">${note}</p>` : ''}
+          <button class="btn-primary" onclick="closeInstallModal()">Got it</button>
+        </div>
+      </div>`;
   }
 
   function renderOrderView() {
@@ -887,6 +1087,23 @@
             <button class="btn-primary" style="width:auto;padding:8px 12px;font-size:12px;" ${state.pushBusy ? 'disabled' : ''} onclick="enableNotifications()">${state.pushBusy ? '…' : 'Enable'}</button>
           </div>
         </div>` : '';
+
+    const showInstallUI = !state.installStandalone;
+    const installBanner = (showInstallUI && !state.installBannerDismissed) ? `
+      <div style="margin:0 16px 12px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
+        <div>
+          <p style="margin:0;font-size:13px;font-weight:600;">📲 Add to your Home Screen</p>
+          <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">One tap, just like an app — no App Store needed.</p>
+        </div>
+        <div style="display:flex;gap:6px;">
+          <button class="btn-ghost" onclick="dismissInstallPrompt()" style="font-size:11px;padding:6px 10px;">No thanks</button>
+          <button class="btn-primary" style="width:auto;padding:8px 12px;font-size:12px;" onclick="openInstallModal()">Show me</button>
+        </div>
+      </div>` : '';
+    const installButton = showInstallUI ? `
+      <div style="text-align:center;margin:0 0 12px;">
+        <button class="btn-ghost" onclick="openInstallModal()" style="font-size:11.5px;padding:5px 10px;">📲 Add to Home Screen</button>
+      </div>` : '';
 
     const mealCards = meals.length === 0
       ? `<div style="text-align:center;padding:60px 24px;color:var(--inkSoft);">No meals posted yet this week. Check back soon.</div>`
@@ -961,12 +1178,15 @@
           <h1 class="display" style="font-size:28px;font-weight:700;margin:8px 0 2px;">LuLu's Kitchen</h1>
           ${state.menu.weekLabel ? `<p class="mono" style="font-size:13px;color:var(--rust);letter-spacing:1px;text-transform:uppercase;margin:0;">${escapeHtml(state.menu.weekLabel)}</p>` : ''}
         </header>
+        ${installButton}
         ${pushBanner}
+        ${installBanner}
         ${mealCards}
         ${closedBanner}
         <div id="bottomSpacer" style="height:24px;"></div>
         ${ticket}
       </div>
+      ${renderInstallModal()}
     `;
   }
 
@@ -976,6 +1196,13 @@
       <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
         <span>${it.qty} × ${escapeHtml(it.name)}</span><span>$${(it.qty * it.price).toFixed(2)}</span>
       </div>`).join('');
+
+    const orderPushSupported = ('serviceWorker' in navigator) && ('PushManager' in window);
+    const orderPushBlock = !orderPushSupported ? '' : state.orderPushSubscribed
+      ? `<p class="mono" style="font-size:11px;color:var(--basil);text-align:center;margin-top:16px;">🔔 We'll notify you when Drew confirms your payment</p>`
+      : `<div style="text-align:center;margin-top:16px;">
+          <button class="btn-ghost" ${state.orderPushBusy ? 'disabled' : ''} onclick="enableOrderNotifications()" style="font-size:12.5px;">${state.orderPushBusy ? '…' : '🔔 Notify me when payment is confirmed'}</button>
+        </div>`;
 
     return `
       <div style="max-width:480px;margin:0 auto;padding:60px 24px;">
@@ -996,6 +1223,7 @@
           with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}" — or visit
           <a href="${venmoWebFallback()}" style="color:var(--basil);">${venmoWebFallback()}</a>
         </p>
+        ${orderPushBlock}
         <button class="btn-ghost" onclick="placeAnotherOrder()" style="width:100%;justify-content:center;margin-top:24px;">Place another order</button>
       </div>
     `;
@@ -1213,6 +1441,19 @@
           </div>
           ${ordersHtml}
           <div style="margin-top:16px;">${archivedHtml}</div>
+        </div>
+
+        <div style="border-top:1px solid var(--line);padding-top:24px;margin-top:24px;">
+          <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 12px;">Notifications</h2>
+          <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+            <div>
+              <p style="margin:0;font-size:14px;font-weight:600;">🔔 New order alerts</p>
+              <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">Get pinged on this device the moment someone submits an order.</p>
+            </div>
+            ${state.drewPushSubscribed
+              ? `<button class="btn-ghost" ${state.drewPushBusy ? 'disabled' : ''} onclick="disableDrewNotifications()" style="font-size:12px;white-space:nowrap;">${state.drewPushBusy ? '…' : 'Turn off'}</button>`
+              : `<button class="btn-primary" style="width:auto;padding:8px 14px;font-size:12px;white-space:nowrap;" ${state.drewPushBusy ? 'disabled' : ''} onclick="enableDrewNotifications()">${state.drewPushBusy ? '…' : 'Enable'}</button>`}
+          </div>
         </div>
 
         <div style="border-top:1px solid var(--line);padding-top:24px;margin-top:24px;">
