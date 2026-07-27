@@ -157,6 +157,10 @@
     drewPushBusy: false,
     orderPushSubscribed: false,
     orderPushBusy: false,
+    testMode: false,
+    testPushSubscribed: false,
+    testPushBusy: false,
+    testPingBusy: false,
     forgotAnswer: '',
     forgotError: '',
     forgotUnlocked: false,
@@ -480,6 +484,8 @@
     } catch (e) { /* fall back to published menu already set as draft */ }
     loadOrders(state.draftMenu.weekLabel);
     checkDrewPushStatus();
+    loadTestMode();
+    checkTestPushStatus();
   }
 
   function tryPin() {
@@ -676,7 +682,7 @@
       state.menu = updated;
       state.draftMenu = { ...state.draftMenu, orderingOpen: updated.orderingOpen };
       render();
-      notifyStatusChange(updated.orderingOpen ? 'open' : 'close', updated.weekLabel);
+      notifyStatusChange(updated.orderingOpen ? 'open' : 'close', updated.weekLabel, state.testMode ? 'test' : 'broadcast');
     } catch (e) {
       alert('Could not update ordering status. Please try again.');
     }
@@ -874,16 +880,119 @@
   function openInstallModal() { state.showInstallModal = true; render(); }
   function closeInstallModal() { state.showInstallModal = false; render(); }
 
-  async function notifyStatusChange(eventType, weekLabel) {
+  async function notifyStatusChange(eventType, weekLabel, target) {
     try {
       await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: eventType, weekLabel }),
+        body: JSON.stringify({ event: eventType, weekLabel, target: target || 'broadcast' }),
       });
     } catch (e) {
       // Best-effort — never block Drew's open/close toggle on a push failure.
     }
+  }
+
+  // ---------- Test mode ----------
+  // Shared flag (kv_store key "testMode") so it's visible/toggleable from either
+  // Jake's or Drew's kitchen view. While on, the open/close toggle notifies test
+  // devices (testPushSub:*) instead of the real customer broadcast (pushSub:*).
+  async function loadTestMode() {
+    try {
+      const res = await window.storage.get('testMode');
+      state.testMode = !!(res && res.value === '1');
+    } catch (e) {
+      state.testMode = false;
+    }
+    render();
+  }
+
+  async function toggleTestMode() {
+    const next = !state.testMode;
+    try {
+      const result = await window.storage.set('testMode', next ? '1' : '0');
+      if (!result) throw new Error('save failed');
+      state.testMode = next;
+      render();
+    } catch (e) {
+      alert('Could not update test mode. Please try again.');
+    }
+  }
+
+  async function checkTestPushStatus() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) { state.testPushSubscribed = false; render(); return; }
+    try {
+      const reg = await navigator.serviceWorker.register('sw.js');
+      const sub = await reg.pushManager.getSubscription();
+      if (!sub) { state.testPushSubscribed = false; render(); return; }
+      const subId = await hashEndpoint(sub.endpoint);
+      const res = await window.storage.get(`testPushSub:${subId}`);
+      state.testPushSubscribed = !!(res && res.value);
+    } catch (e) {
+      state.testPushSubscribed = false;
+    }
+    render();
+  }
+
+  async function enableTestNotifications() {
+    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+      alert("Notifications aren't supported on this browser/device.");
+      return;
+    }
+    state.testPushBusy = true; render();
+    try {
+      const permission = await Notification.requestPermission();
+      if (permission !== 'granted') { state.testPushBusy = false; render(); return; }
+      const reg = await navigator.serviceWorker.register('sw.js');
+      let sub = await reg.pushManager.getSubscription();
+      if (!sub) {
+        sub = await reg.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+        });
+      }
+      const subId = await hashEndpoint(sub.endpoint);
+      const result = await window.storage.set(`testPushSub:${subId}`, JSON.stringify(sub));
+      if (!result) throw new Error('save failed');
+      state.testPushSubscribed = true;
+    } catch (e) {
+      alert('Could not enable test notifications. Please try again.');
+    }
+    state.testPushBusy = false;
+    render();
+  }
+
+  async function disableTestNotifications() {
+    state.testPushBusy = true; render();
+    try {
+      if ('serviceWorker' in navigator) {
+        const reg = await navigator.serviceWorker.getRegistration('sw.js');
+        const sub = reg && await reg.pushManager.getSubscription();
+        if (sub) {
+          const subId = await hashEndpoint(sub.endpoint);
+          await window.storage.delete(`testPushSub:${subId}`);
+        }
+      }
+      state.testPushSubscribed = false;
+    } catch (e) {
+      alert('Could not turn off test notifications. Please try again.');
+    }
+    state.testPushBusy = false;
+    render();
+  }
+
+  async function sendTestPing() {
+    state.testPingBusy = true; render();
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'test_ping', target: 'test' }),
+      });
+    } catch (e) {
+      // no-op — the button click itself will still show it was attempted below
+    }
+    state.testPingBusy = false;
+    render();
   }
 
   // ---------- Drew's "new order" notifications ----------
@@ -1374,6 +1483,15 @@
           </div>
         </div>
 
+        ${state.testMode ? `
+        <div style="background:#FFF3CD;border:2px solid #E8A33D;border-radius:12px;padding:14px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+          <div>
+            <p style="margin:0;font-size:14px;font-weight:700;color:#7A5100;">🧪 Test mode is ON</p>
+            <p style="margin:2px 0 0;font-size:12px;color:#7A5100;">Ordering open/close pings test devices only — real customers won't be notified.</p>
+          </div>
+          <button class="btn-ghost" onclick="toggleTestMode()" style="font-size:12px;white-space:nowrap;background:#fff;">Turn off</button>
+        </div>` : ''}
+
         <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:20px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
           <div>
             <label class="label" style="margin-bottom:2px;">Ordering status</label>
@@ -1453,6 +1571,30 @@
             ${state.drewPushSubscribed
               ? `<button class="btn-ghost" ${state.drewPushBusy ? 'disabled' : ''} onclick="disableDrewNotifications()" style="font-size:12px;white-space:nowrap;">${state.drewPushBusy ? '…' : 'Turn off'}</button>`
               : `<button class="btn-primary" style="width:auto;padding:8px 14px;font-size:12px;white-space:nowrap;" ${state.drewPushBusy ? 'disabled' : ''} onclick="enableDrewNotifications()">${state.drewPushBusy ? '…' : 'Enable'}</button>`}
+          </div>
+
+          <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:12px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:12px;">
+              <div>
+                <p style="margin:0;font-size:14px;font-weight:600;">🧪 Test mode</p>
+                <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">While on, the open/close toggle notifies test devices below instead of real customers.</p>
+              </div>
+              <button class="btn-primary" style="width:auto;padding:8px 14px;font-size:12px;white-space:nowrap;background:${state.testMode ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleTestMode()">
+                ${state.testMode ? 'Turn off' : 'Turn on'}
+              </button>
+            </div>
+            <div style="border-top:1px solid var(--line);padding-top:12px;display:flex;justify-content:space-between;align-items:center;gap:12px;">
+              <div>
+                <p style="margin:0;font-size:13px;font-weight:600;">This device</p>
+                <p style="margin:2px 0 0;font-size:12px;color:var(--inkSoft);">Register to receive test pushes. Do this on both your phone and Drew's.</p>
+              </div>
+              ${state.testPushSubscribed
+                ? `<button class="btn-ghost" ${state.testPushBusy ? 'disabled' : ''} onclick="disableTestNotifications()" style="font-size:12px;white-space:nowrap;">${state.testPushBusy ? '…' : 'Turn off'}</button>`
+                : `<button class="btn-primary" style="width:auto;padding:8px 14px;font-size:12px;white-space:nowrap;" ${state.testPushBusy ? 'disabled' : ''} onclick="enableTestNotifications()">${state.testPushBusy ? '…' : 'Register'}</button>`}
+            </div>
+            <button class="btn-ghost" ${state.testPingBusy ? 'disabled' : ''} onclick="sendTestPing()" style="font-size:12px;margin-top:12px;width:100%;justify-content:center;">
+              ${state.testPingBusy ? 'Sending…' : '📨 Send test ping to all registered test devices'}
+            </button>
           </div>
         </div>
 
