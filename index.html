@@ -115,6 +115,12 @@
 
   const DREW_VENMO = 'Andrew-Dzib-Galvan';
   const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
+  // Supabase Storage bucket for drag-and-dropped meal/special-item photos. Must be created
+  // as a PUBLIC bucket in the Supabase dashboard first (Storage → New bucket → "meal-photos"),
+  // with a policy allowing inserts via the anon/publishable key above — same trust model as
+  // the wide-open kv_store RLS policies. Nothing else in this file assumes the bucket exists,
+  // so pasting a plain image link still works fine even before that setup is done.
+  const PHOTO_BUCKET = 'meal-photos';
 
   // ---------- Add to Home Screen detection ----------
   function detectInstallPlatform() {
@@ -177,6 +183,9 @@
     archivedOrders: [],
     archivedLoading: false,
     showArchived: false,
+    exportingXlsx: false,
+    photoUploading: {},
+    specialPhotoUploading: false,
   };
 
   function emptyMeal() {
@@ -303,6 +312,99 @@
     return { weekLabel, meals };
   }
 
+  // ---------- photo upload (drag-and-drop JPEG/PNG straight into Supabase Storage) ----------
+  // Downscales/compresses in-browser before upload so a straight-from-camera photo doesn't
+  // balloon the bucket or slow down the customer view. Caps the long edge at 1200px.
+  function resizeImageFile(file, maxDim = 1200, quality = 0.82) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const img = new Image();
+        img.onload = () => {
+          let { width, height } = img;
+          if (width > maxDim || height > maxDim) {
+            if (width >= height) { height = Math.round(height * maxDim / width); width = maxDim; }
+            else { width = Math.round(width * maxDim / height); height = maxDim; }
+          }
+          const canvas = document.createElement('canvas');
+          canvas.width = width; canvas.height = height;
+          canvas.getContext('2d').drawImage(img, 0, 0, width, height);
+          canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('Could not process image')), 'image/jpeg', quality);
+        };
+        img.onerror = () => reject(new Error('Could not read that image'));
+        img.src = reader.result;
+      };
+      reader.onerror = () => reject(new Error('Could not read that file'));
+      reader.readAsDataURL(file);
+    });
+  }
+
+  async function uploadPhotoToStorage(blob, path) {
+    const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${PHOTO_BUCKET}/${path}`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' },
+      body: blob,
+    });
+    if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+    return `${SUPABASE_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${path}`;
+  }
+
+  function triggerMealPhotoPicker(mealId) {
+    const el = document.getElementById(`mealPhotoInput-${mealId}`);
+    if (el) el.click();
+  }
+  function handleMealPhotoDrop(e, el, mealId) {
+    e.preventDefault();
+    el.style.borderColor = 'var(--line)';
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) processMealPhoto(file, mealId);
+  }
+  function handleMealPhotoInputChange(input, mealId) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (file) processMealPhoto(file, mealId);
+  }
+  async function processMealPhoto(file, mealId) {
+    if (!file.type.startsWith('image/')) { alert('Please drop a photo (JPEG or PNG).'); return; }
+    state.photoUploading = { ...state.photoUploading, [mealId]: true }; render();
+    try {
+      const blob = await resizeImageFile(file);
+      const url = await uploadPhotoToStorage(blob, `meal-${mealId}-${Date.now()}.jpg`);
+      setMealField(mealId, 'imageUrl', url);
+    } catch (e) {
+      alert("Couldn't upload that photo. Make sure the \"meal-photos\" storage bucket exists and is public, then try again.");
+    }
+    state.photoUploading = { ...state.photoUploading, [mealId]: false }; render();
+  }
+
+  function triggerSpecialPhotoPicker() {
+    const el = document.getElementById('specialPhotoInput');
+    if (el) el.click();
+  }
+  function handleSpecialPhotoDrop(e, el) {
+    e.preventDefault();
+    el.style.borderColor = 'var(--line)';
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (file) processSpecialPhoto(file);
+  }
+  function handleSpecialPhotoInputChange(input) {
+    const file = input.files && input.files[0];
+    input.value = '';
+    if (file) processSpecialPhoto(file);
+  }
+  async function processSpecialPhoto(file) {
+    if (!file.type.startsWith('image/')) { alert('Please drop a photo (JPEG or PNG).'); return; }
+    state.specialPhotoUploading = true; render();
+    try {
+      const blob = await resizeImageFile(file);
+      const url = await uploadPhotoToStorage(blob, `special-${Date.now()}.jpg`);
+      setSpecialItemField('imageUrl', url);
+    } catch (e) {
+      alert("Couldn't upload that photo. Make sure the \"meal-photos\" storage bucket exists and is public, then try again.");
+    }
+    state.specialPhotoUploading = false; render();
+  }
+
   let mammothLoadPromise = null;
   function ensureMammothLoaded() {
     if (window.mammoth) return Promise.resolve();
@@ -315,6 +417,43 @@
       document.head.appendChild(script);
     });
     return mammothLoadPromise;
+  }
+
+  // ExcelJS builds a true, styled .xlsx workbook (merged cells, fills, borders) in-browser —
+  // same lazy-load-from-CDN pattern as mammoth above, only fetched when Drew actually exports.
+  let exceljsLoadPromise = null;
+  function ensureExcelJSLoaded() {
+    if (window.ExcelJS) return Promise.resolve();
+    if (exceljsLoadPromise) return exceljsLoadPromise;
+    exceljsLoadPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = 'https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js';
+      script.onload = () => resolve();
+      script.onerror = () => reject(new Error('ExcelJS failed to load'));
+      document.head.appendChild(script);
+    });
+    return exceljsLoadPromise;
+  }
+
+  const DAY_ABBREV = {
+    monday: 'Mon', mon: 'Mon',
+    tuesday: 'Tues', tues: 'Tues', tue: 'Tues',
+    wednesday: 'Wed', wed: 'Wed',
+    thursday: 'Thurs', thurs: 'Thurs', thu: 'Thurs',
+    friday: 'Fri', fri: 'Fri',
+    saturday: 'Sat', sat: 'Sat',
+    sunday: 'Sun', sun: 'Sun',
+  };
+  function abbrevDay(day) {
+    if (!day) return '';
+    const key = day.trim().toLowerCase().replace(/:$/, '');
+    return DAY_ABBREV[key] || day;
+  }
+  const DAY_ORDER = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+  function dayRank(day) {
+    const key = (day || '').trim().toLowerCase().replace(/:$/, '');
+    const idx = DAY_ORDER.findIndex(d => d === key || d.startsWith(key));
+    return idx === -1 ? 999 : idx;
   }
 
   function handleDrop(e, el) {
@@ -842,18 +981,142 @@
     }
   }
 
-  function exportCSV() {
-    const rows = [['Customer', 'Meal', 'Qty', 'Price', 'Line Total', 'Payment Confirmed']];
-    state.orders.forEach(o => {
-      o.items.forEach(it => rows.push([o.customerName, it.name, it.qty, it.price.toFixed(2), (it.qty * it.price).toFixed(2), '']));
-      rows.push([o.customerName, '', '', 'ORDER TOTAL', o.total.toFixed(2), o.paidConfirmed ? 'Yes' : 'No']);
-    });
-    const csv = rows.map(r => r.map(c => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = `${state.menu.weekLabel.replace(/\s+/g, '_')}_orders.csv`; a.click();
-    URL.revokeObjectURL(url);
+  // Builds a true .xlsx workbook shaped like Drew's own "Meal Prep Week N" tracking sheet:
+  // one column per day's meal (name in a sub-header under the day label), one row per
+  // customer with a count per meal, and Total Meals as both a row and a column. Matches
+  // items to columns by mealId (stable even if Drew edits a meal's name mid-week); anything
+  // that no longer matches a current menu item (e.g. a meal was deleted after orders came
+  // in) falls into a catch-all "Other" column rather than being silently dropped.
+  async function exportWorkbook() {
+    state.exportingXlsx = true; render();
+    try {
+      await ensureExcelJSLoaded();
+
+      const columns = state.menu.meals
+        .slice()
+        .sort((a, b) => dayRank(a.day) - dayRank(b.day))
+        .map(m => ({ id: m.id, dayLabel: abbrevDay(m.day) || '—', mealName: m.name || '(unnamed)' }));
+
+      const si = state.menu.specialItem;
+      if (si && si.active && si.name && si.name.trim()) {
+        columns.push({ id: 'special', dayLabel: '✨ Special', mealName: si.name });
+      }
+
+      let hasOther = false;
+      state.orders.forEach(o => o.items.forEach(it => {
+        if (!columns.some(c => c.id === it.mealId)) hasOther = true;
+      }));
+      if (hasOther) columns.push({ id: '__other__', dayLabel: 'Other', mealName: '' });
+
+      // One row per customer name, merging multiple orders from the same person that week.
+      const byName = {};
+      state.orders.forEach(o => {
+        if (!byName[o.customerName]) {
+          byName[o.customerName] = { name: o.customerName, counts: {} };
+          columns.forEach(c => { byName[o.customerName].counts[c.id] = 0; });
+        }
+        o.items.forEach(it => {
+          const col = columns.find(c => c.id === it.mealId) || columns.find(c => c.id === '__other__');
+          if (col) byName[o.customerName].counts[col.id] += it.qty;
+        });
+      });
+      const rows = Object.values(byName).map(r => ({
+        ...r, total: columns.reduce((s, c) => s + (r.counts[c.id] || 0), 0),
+      }));
+
+      const colTotals = columns.map(c => rows.reduce((s, r) => s + (r.counts[c.id] || 0), 0));
+      const grandTotal = colTotals.reduce((a, b) => a + b, 0);
+
+      const wb = new window.ExcelJS.Workbook();
+      const ws = wb.addWorksheet('Meal Prep');
+      const numCols = 1 + columns.length + 1; // Name + one per meal + Total Meals
+
+      ws.getColumn(1).width = 16;
+      columns.forEach((c, i) => { ws.getColumn(2 + i).width = 18; });
+      ws.getColumn(numCols).width = 12;
+
+      const thin = { style: 'thin', color: { argb: 'FF000000' } };
+      const allBorders = { top: thin, left: thin, bottom: thin, right: thin };
+      const applyBorders = (row, cols) => { for (let c = 1; c <= cols; c++) ws.getCell(row, c).border = allBorders; };
+
+      // Row 1 — title
+      ws.mergeCells(1, 1, 1, numCols);
+      const titleCell = ws.getCell(1, 1);
+      titleCell.value = `Meal Prep ${state.menu.weekLabel || ''}`.trim();
+      titleCell.font = { bold: true, size: 14 };
+      titleCell.alignment = { horizontal: 'center', vertical: 'middle' };
+      ws.getRow(1).height = 24;
+      applyBorders(1, numCols);
+
+      // Row 2 — Name / day labels / Total Meals
+      const headerRow = ws.getRow(2);
+      headerRow.getCell(1).value = 'Name';
+      columns.forEach((c, i) => { headerRow.getCell(2 + i).value = c.dayLabel; });
+      headerRow.getCell(numCols).value = 'Total Meals';
+      for (let c = 1; c <= numCols; c++) {
+        const cell = ws.getCell(2, c);
+        cell.font = { bold: true };
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+      }
+      ws.getRow(2).height = 30;
+      applyBorders(2, numCols);
+
+      // Row 3 — meal name under each day; Name/Total Meals columns are solid dark, no text
+      columns.forEach((c, i) => { ws.getCell(3, 2 + i).value = c.mealName; });
+      for (let c = 1; c <= numCols; c++) {
+        const cell = ws.getCell(3, c);
+        cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
+        if (c === 1 || c === numCols) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A1A' } };
+      }
+      ws.getRow(3).height = 30;
+      applyBorders(3, numCols);
+
+      // Data rows — one per customer
+      let r = 4;
+      rows.forEach(row => {
+        const dataRow = ws.getRow(r);
+        dataRow.getCell(1).value = row.name;
+        dataRow.getCell(1).font = { bold: true };
+        columns.forEach((c, i) => { dataRow.getCell(2 + i).value = row.counts[c.id] || 0; });
+        dataRow.getCell(numCols).value = row.total;
+        dataRow.getCell(numCols).font = { bold: true };
+        for (let c = 1; c <= numCols; c++) {
+          ws.getCell(r, c).alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+        }
+        applyBorders(r, numCols);
+        r++;
+      });
+
+      // Totals row
+      const totalRow = ws.getRow(r);
+      totalRow.getCell(1).value = 'Total Meals';
+      totalRow.getCell(1).font = { bold: true };
+      colTotals.forEach((t, i) => {
+        totalRow.getCell(2 + i).value = t;
+        totalRow.getCell(2 + i).font = { bold: true };
+      });
+      totalRow.getCell(numCols).value = grandTotal;
+      totalRow.getCell(numCols).font = { bold: true };
+      for (let c = 1; c <= numCols; c++) {
+        const cell = ws.getCell(r, c);
+        cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F2F2' } };
+      }
+      applyBorders(r, numCols);
+
+      const buffer = await wb.xlsx.writeBuffer();
+      const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(state.menu.weekLabel || 'meal_prep').replace(/\s+/g, '_')}_meal_prep.xlsx`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert('Could not build the Excel file. Please try again.');
+    }
+    state.exportingXlsx = false; render();
   }
 
   function parseFromPaste() {
@@ -1316,26 +1579,25 @@
     const si = state.menu.specialItem;
     const specialActive = !!(si && si.active && si.name && si.name.trim());
     const specialCard = specialActive ? `
-      <div style="padding:0 16px;margin-bottom:14px;">
+      <div style="padding:0 16px;margin-bottom:20px;">
         ${si.bannerText ? `
-          <div style="background:var(--rust);color:#fff;text-align:center;border-radius:10px 10px 0 0;padding:7px 14px;">
-            <span class="mono" style="font-size:11.5px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;">✨ ${escapeHtml(si.bannerText)}</span>
+          <div style="background:var(--rust);color:#fff;text-align:center;border-radius:14px 14px 0 0;padding:11px 16px;">
+            <span class="mono" style="font-size:14px;font-weight:800;letter-spacing:0.8px;text-transform:uppercase;">✨ ${escapeHtml(si.bannerText)} ✨</span>
           </div>` : ''}
-        <div class="meal-card" style="border:2px solid var(--rust);${si.bannerText ? 'border-top:none;border-radius:0 0 12px 12px;' : ''}">
-          <div style="width:96px;min-width:96px;background:var(--paperDim);display:flex;align-items:center;justify-content:center;">
+        <div class="meal-card" style="border:3px solid var(--rust);box-shadow:0 6px 18px rgba(201,90,110,0.2);${si.bannerText ? 'border-top:none;border-radius:0 0 14px 14px;' : 'border-radius:14px;'}">
+          <div style="width:120px;min-width:120px;background:var(--paperDim);display:flex;align-items:center;justify-content:center;">
             ${si.imageUrl
               ? `<img src="${escapeHtml(si.imageUrl)}" alt="${escapeHtml(si.name)}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none'">`
-              : `<span style="font-size:22px;opacity:0.35;">⭐</span>`}
+              : `<span style="font-size:34px;opacity:0.4;">⭐</span>`}
           </div>
-          <div style="flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:4px;">
-            <span class="mono" style="font-size:10.5px;color:var(--rust);letter-spacing:0.5px;text-transform:uppercase;">Special of the week</span>
-            <div style="display:flex;justify-content:space-between;gap:8px;">
-              <h3 style="font-size:15.5px;font-weight:600;margin:0;">${escapeHtml(si.name)}</h3>
-              <span class="mono" style="font-size:14px;color:var(--rust);white-space:nowrap;">$${(parseFloat(si.price) || 0).toFixed(2)}</span>
+          <div style="flex:1;padding:16px 16px;display:flex;flex-direction:column;gap:6px;">
+            <div style="display:flex;justify-content:space-between;gap:8px;align-items:flex-start;">
+              <h3 style="font-size:18.5px;font-weight:700;margin:0;display:flex;align-items:center;gap:6px;">⭐ ${escapeHtml(si.name)}</h3>
+              <span class="mono" style="font-size:16px;font-weight:700;color:var(--rust);white-space:nowrap;">$${(parseFloat(si.price) || 0).toFixed(2)}</span>
             </div>
-            ${si.description ? `<p style="font-size:12.5px;color:var(--inkSoft);margin:0;line-height:1.4;">${escapeHtml(si.description)}</p>` : ''}
+            ${si.description ? `<p style="font-size:13px;color:var(--inkSoft);margin:0;line-height:1.45;">${escapeHtml(si.description)}</p>` : ''}
             ${orderingOpen ? `
-              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+              <div style="display:flex;align-items:center;gap:10px;margin-top:8px;">
                 <button class="stepper-btn" onclick="changeQty('special',-1)" aria-label="Remove one ${escapeHtml(si.name)}">−</button>
                 <span class="mono" style="min-width:18px;text-align:center;font-size:14px;">${state.qty['special'] || 0}</span>
                 <button class="stepper-btn add" onclick="changeQty('special',1)" aria-label="Add one ${escapeHtml(si.name)}">+</button>
@@ -1535,15 +1797,27 @@
         </div>
         <textarea class="field" rows="2" style="margin-bottom:8px;resize:vertical;" placeholder="Ingredients / description"
           oninput="setMealField('${m.id}','description',this.value)">${escapeHtml(m.description)}</textarea>
-        <div style="display:flex;gap:8px;">
-          <div>
-            <input class="field" style="width:90px;" type="number" step="0.01" placeholder="Price" value="${escapeHtml(m.price)}" oninput="setMealField('${m.id}','price',this.value)">
-          </div>
-          <div style="flex:1;display:flex;align-items:center;gap:6px;">
-            <span style="font-size:14px;">🖼</span>
-            <input class="field" style="flex:1;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(m.imageUrl)}" oninput="setMealField('${m.id}','imageUrl',this.value)">
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <input class="field" style="width:90px;" type="number" step="0.01" placeholder="Price" value="${escapeHtml(m.price)}" oninput="setMealField('${m.id}','price',this.value)">
+          <div id="mealPhotoZone-${m.id}"
+            style="flex:1;border:2px dashed var(--line);border-radius:10px;padding:8px 10px;display:flex;align-items:center;gap:10px;cursor:pointer;"
+            ondragover="event.preventDefault();this.style.borderColor='var(--basil)';"
+            ondragleave="this.style.borderColor='var(--line)';"
+            ondrop="handleMealPhotoDrop(event, this, '${m.id}')"
+            onclick="triggerMealPhotoPicker('${m.id}')">
+            ${m.imageUrl
+              ? `<img src="${escapeHtml(m.imageUrl)}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;flex-shrink:0;" onerror="this.style.display='none'">`
+              : `<span style="font-size:16px;flex-shrink:0;">📷</span>`}
+            <span style="font-size:11.5px;color:var(--inkSoft);">
+              ${state.photoUploading[m.id] ? 'Uploading…' : (m.imageUrl ? 'Tap or drop to replace photo' : 'Drop a photo, or tap to choose')}
+            </span>
+            <input type="file" accept="image/*" id="mealPhotoInput-${m.id}" style="display:none;" onchange="handleMealPhotoInputChange(this,'${m.id}')">
           </div>
         </div>
+        <details>
+          <summary style="font-size:11px;color:var(--inkSoft);cursor:pointer;margin-bottom:4px;">or paste a photo link instead</summary>
+          <input class="field" style="margin-top:6px;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(m.imageUrl)}" oninput="setMealField('${m.id}','imageUrl',this.value)">
+        </details>
       </div>
     `).join('');
 
@@ -1576,7 +1850,7 @@
           <span class="mono" style="font-size:13px;font-weight:600;">Grand total: $${grandTotal().toFixed(2)}</span>
           <div style="display:flex;gap:8px;">
             <button class="btn-ghost" onclick="clearAllOrders()">🗑 Clear all orders</button>
-            <button class="btn-ghost" onclick="exportCSV()">⬇ Export CSV</button>
+            <button class="btn-ghost" ${state.exportingXlsx ? 'disabled' : ''} onclick="exportWorkbook()">⬇ ${state.exportingXlsx ? 'Building…' : 'Export Excel'}</button>
           </div>
         </div>`;
 
@@ -1653,13 +1927,27 @@
           <input class="field" style="margin-bottom:8px;" placeholder="Banner text (e.g. \"This week only!\")" value="${escapeHtml(dm.specialItem ? dm.specialItem.bannerText : '')}" oninput="setSpecialItemField('bannerText',this.value)">
           <textarea class="field" rows="2" style="margin-bottom:8px;resize:vertical;" placeholder="Description"
             oninput="setSpecialItemField('description',this.value)">${escapeHtml(dm.specialItem ? dm.specialItem.description : '')}</textarea>
-          <div style="display:flex;gap:8px;">
+          <div style="display:flex;gap:8px;margin-bottom:8px;">
             <input class="field" style="width:90px;" type="number" step="0.01" placeholder="Price" value="${escapeHtml(dm.specialItem ? dm.specialItem.price : '')}" oninput="setSpecialItemField('price',this.value)">
-            <div style="flex:1;display:flex;align-items:center;gap:6px;">
-              <span style="font-size:14px;">🖼</span>
-              <input class="field" style="flex:1;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(dm.specialItem ? dm.specialItem.imageUrl : '')}" oninput="setSpecialItemField('imageUrl',this.value)">
+            <div id="specialPhotoZone"
+              style="flex:1;border:2px dashed var(--line);border-radius:10px;padding:8px 10px;display:flex;align-items:center;gap:10px;cursor:pointer;"
+              ondragover="event.preventDefault();this.style.borderColor='var(--basil)';"
+              ondragleave="this.style.borderColor='var(--line)';"
+              ondrop="handleSpecialPhotoDrop(event, this)"
+              onclick="triggerSpecialPhotoPicker()">
+              ${dm.specialItem && dm.specialItem.imageUrl
+                ? `<img src="${escapeHtml(dm.specialItem.imageUrl)}" style="width:36px;height:36px;object-fit:cover;border-radius:6px;flex-shrink:0;" onerror="this.style.display='none'">`
+                : `<span style="font-size:16px;flex-shrink:0;">📷</span>`}
+              <span style="font-size:11.5px;color:var(--inkSoft);">
+                ${state.specialPhotoUploading ? 'Uploading…' : (dm.specialItem && dm.specialItem.imageUrl ? 'Tap or drop to replace photo' : 'Drop a photo, or tap to choose')}
+              </span>
+              <input type="file" accept="image/*" id="specialPhotoInput" style="display:none;" onchange="handleSpecialPhotoInputChange(this)">
             </div>
           </div>
+          <details>
+            <summary style="font-size:11px;color:var(--inkSoft);cursor:pointer;margin-bottom:4px;">or paste a photo link instead</summary>
+            <input class="field" style="margin-top:6px;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(dm.specialItem ? dm.specialItem.imageUrl : '')}" oninput="setSpecialItemField('imageUrl',this.value)">
+          </details>
         </div>
 
         <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 6px;">Drop in this week's menu</h2>
