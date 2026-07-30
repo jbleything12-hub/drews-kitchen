@@ -132,7 +132,7 @@
   let state = {
     loading: true,
     view: 'order', // order | pinGate | kitchen
-    menu: { weekLabel: '', venmoUsername: '', meals: [], orderingOpen: true },
+    menu: { weekLabel: '', venmoUsername: '', meals: [], orderingOpen: true, specialItem: emptySpecialItem() },
     draftMenu: null,
     auth: { pin: '2468', question: '', answer: '' },
     qty: {},
@@ -149,8 +149,6 @@
     pushPermission: (typeof Notification !== 'undefined' ? Notification.permission : 'unsupported'),
     pushPromptDismissed: localStorage.getItem('dk_push_dismissed') === '1',
     pushBusy: false,
-    notifBroken: false,
-    notifBrokenDismissed: localStorage.getItem('dk_notif_broken_dismissed') === '1',
     installPlatform: detectInstallPlatform(),
     installStandalone: isRunningStandalone(),
     installBannerDismissed: localStorage.getItem('dk_install_dismissed') === '1',
@@ -183,6 +181,19 @@
 
   function emptyMeal() {
     return { id: 'm' + Math.random().toString(36).slice(2, 9), name: '', description: '', price: '', imageUrl: '', day: '' };
+  }
+
+  // Special item of the week: a Drew-editable bonus menu card, shown above the regular
+  // meals with a custom banner when active. `active` is toggled instantly (like ordering
+  // open/closed) independent of the normal draft/publish cycle, so Drew can turn it on/off
+  // for a given week without re-publishing the whole menu. Its id is fixed (not random) so
+  // changeQty/cart logic can address it like any other orderable item.
+  function emptySpecialItem() {
+    return { name: '', description: '', price: '', imageUrl: '', bannerText: '', active: false };
+  }
+  function normalizeSpecialItem(menu) {
+    if (!menu.specialItem || typeof menu.specialItem !== 'object') menu.specialItem = emptySpecialItem();
+    return menu;
   }
 
   function stripBullet(line) {
@@ -353,11 +364,12 @@
       if (res && res.value) {
         state.menu = JSON.parse(res.value);
         if (typeof state.menu.orderingOpen !== 'boolean') state.menu.orderingOpen = true;
+        normalizeSpecialItem(state.menu);
       } else {
-        state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true };
+        state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true, specialItem: emptySpecialItem() };
       }
     } catch (e) {
-      state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true };
+      state.menu = { weekLabel: 'Week 1', venmoUsername: '', meals: [emptyMeal()], orderingOpen: true, specialItem: emptySpecialItem() };
     }
     state.draftMenu = JSON.parse(JSON.stringify(state.menu));
     state.loading = false;
@@ -378,12 +390,14 @@
         const res = await window.storage.get('menu');
         if (!res || !res.value) return;
         const fresh = JSON.parse(res.value);
+        normalizeSpecialItem(fresh);
         const freshOpen = typeof fresh.orderingOpen === 'boolean' ? fresh.orderingOpen : true;
-        if (freshOpen !== state.menu.orderingOpen) {
-          state.menu = { ...state.menu, orderingOpen: freshOpen };
+        const openChanged = freshOpen !== state.menu.orderingOpen;
+        const specialChanged = JSON.stringify(fresh.specialItem) !== JSON.stringify(state.menu.specialItem);
+        if (openChanged || specialChanged) {
+          state.menu = { ...state.menu, orderingOpen: freshOpen, specialItem: fresh.specialItem };
           render();
         }
-        checkNotificationHealth();
       } catch (e) {
         // Best-effort — keep showing the last known status rather than erroring out.
       }
@@ -443,8 +457,19 @@
   }
 
   // ---------- derived ----------
+  // Combines the active special item (if any) with the regular meals into one addressable
+  // list, so cart totals/checkout treat it exactly like any other meal. Fixed id 'special'
+  // lets changeQty/qty tracking work the same way it does for meals.
+  function orderableItems() {
+    const si = state.menu.specialItem;
+    const items = state.menu.meals.slice();
+    if (si && si.active && si.name && si.name.trim()) {
+      items.unshift({ id: 'special', name: si.name, description: si.description, price: si.price, imageUrl: si.imageUrl, day: '' });
+    }
+    return items;
+  }
   function totalDue() {
-    return state.menu.meals.reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
+    return orderableItems().reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
   }
   function selectedCount() {
     return Object.values(state.qty).reduce((a, b) => a + b, 0);
@@ -470,6 +495,10 @@
     state.draftMenu.meals = state.draftMenu.meals.map(m => m.id === id ? { ...m, [field]: v } : m);
     scheduleAutosave();
   }
+  function setSpecialItemField(field, v) {
+    state.draftMenu.specialItem = { ...(state.draftMenu.specialItem || emptySpecialItem()), [field]: v };
+    scheduleAutosave();
+  }
 
   function setPaidCheckbox(v) { state.paidCheckbox = v; render(); }
 
@@ -477,7 +506,7 @@
     state.orderError = '';
     if (state.menu.orderingOpen === false) { state.orderError = 'Ordering is closed for this week.'; render(); return; }
     if (!state.customerName.trim()) { state.orderError = 'Enter your name so Drew knows whose order this is.'; render(); return; }
-    const items = state.menu.meals.filter(m => (state.qty[m.id] || 0) > 0);
+    const items = orderableItems().filter(m => (state.qty[m.id] || 0) > 0);
     if (items.length === 0) { state.orderError = 'Pick at least one meal before continuing.'; render(); return; }
     state.paymentStep = true;
     render();
@@ -489,7 +518,7 @@
     state.orderError = '';
     if (state.menu.orderingOpen === false) { state.orderError = 'Ordering is closed for this week.'; render(); return; }
     if (!state.paidCheckbox) { state.orderError = "Check the box once you've sent payment to Drew."; render(); return; }
-    const items = state.menu.meals
+    const items = orderableItems()
       .filter(m => (state.qty[m.id] || 0) > 0)
       .map(m => ({ mealId: m.id, name: m.name, price: parseFloat(m.price) || 0, qty: state.qty[m.id] }));
     if (items.length === 0) { state.orderError = 'Pick at least one meal before sending your order.'; render(); return; }
@@ -532,7 +561,7 @@
     try {
       const draftRes = await window.storage.get('menuDraft');
       if (draftRes && draftRes.value) {
-        state.draftMenu = JSON.parse(draftRes.value);
+        state.draftMenu = normalizeSpecialItem(JSON.parse(draftRes.value));
         render();
       }
     } catch (e) { /* fall back to published menu already set as draft */ }
@@ -742,6 +771,28 @@
     }
   }
 
+  // Instant on/off for this week, independent of the draft/publish cycle — flips the
+  // ALREADY-PUBLISHED special item's active flag, same pattern as toggleOrderingOpen. Edit
+  // the name/price/etc. via the normal "Save & publish menu" flow first; this toggle just
+  // decides whether that saved content shows up for customers this particular week.
+  async function toggleSpecialItemActive() {
+    const current = state.menu.specialItem || emptySpecialItem();
+    if (!current.active && !current.name.trim()) {
+      alert('Add a name for the special item below and publish it before turning it on.');
+      return;
+    }
+    const updated = { ...state.menu, specialItem: { ...current, active: !current.active } };
+    try {
+      const result = await window.storage.set('menu', JSON.stringify(updated));
+      if (!result) throw new Error('save failed');
+      state.menu = updated;
+      state.draftMenu = { ...state.draftMenu, specialItem: { ...(state.draftMenu.specialItem || current), active: updated.specialItem.active } };
+      render();
+    } catch (e) {
+      alert('Could not update the special item. Please try again.');
+    }
+  }
+
   async function clearPublishedMenu() {
     const proceed = confirm(`Clear the menu customers currently see? They'll see "no meals posted yet" until you publish again. This won't touch what you're editing below.`);
     if (!proceed) return;
@@ -912,7 +963,6 @@
       const result = await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
       if (!result) throw new Error('save failed');
       state.pushSubscribed = true;
-      localStorage.setItem('dk_notif_ever_enabled', '1');
       // If they're enabling this from the order confirmation screen (rather than
       // while just browsing), also link this same subscription to that order —
       // one "Enable" covers both ordering open/close and this order's payment confirmation.
@@ -945,66 +995,6 @@
     state.pushPromptDismissed = true;
     localStorage.setItem('dk_push_dismissed', '1');
     render();
-  }
-
-  function dismissNotifBroken() {
-    state.notifBrokenDismissed = true;
-    localStorage.setItem('dk_notif_broken_dismissed', '1');
-    render();
-  }
-
-  // ---------- notification health check ----------
-  // Runs quietly in the background (see startMenuPoll). Two kinds of problems:
-  //   1. Fixable without bothering anyone: permission is still granted, but either the
-  //      browser subscription itself or our server's copy of it got lost somehow (site
-  //      data cleared, PWA reinstalled, our own stale-subscription cleanup ran, etc).
-  //      These just get silently repaired.
-  //   2. Not fixable by us: permission was actively revoked (browser/OS setting). JS can't
-  //      re-prompt once denied — only the person can flip it back on. Only worth mentioning
-  //      to someone who'd previously enabled notifications, so it's never shown to people
-  //      who never opted in in the first place.
-  async function checkNotificationHealth() {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) return;
-    const permission = Notification.permission;
-    state.pushPermission = permission;
-
-    if (permission === 'denied') {
-      const everEnabled = localStorage.getItem('dk_notif_ever_enabled') === '1';
-      state.pushSubscribed = false;
-      state.notifBroken = everEnabled;
-      render();
-      return;
-    }
-
-    try {
-      const reg = await navigator.serviceWorker.getRegistration('sw.js');
-      let sub = reg && await reg.pushManager.getSubscription();
-
-      if (!sub && permission === 'granted' && localStorage.getItem('dk_notif_ever_enabled') === '1') {
-        // Permission's still granted but the subscription itself is gone — re-subscribe
-        // silently, no prompt needed since permission was already granted.
-        const freshReg = reg || await navigator.serviceWorker.register('sw.js');
-        sub = await freshReg.pushManager.subscribe({
-          userVisibleOnly: true,
-          applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
-        });
-      }
-
-      if (!sub) return; // never subscribed on this device — nothing to repair
-
-      const subId = await hashEndpoint(sub.endpoint);
-      const res = await window.storage.get(`pushSub:${subId}`);
-      if (!res || !res.value) {
-        // Server's copy is gone (e.g. our own cleanup removed it after a failed send)
-        // even though the browser still has it — silently re-save it.
-        await window.storage.set(`pushSub:${subId}`, JSON.stringify(sub));
-      }
-      state.pushSubscribed = true;
-      state.notifBroken = false;
-      render();
-    } catch (e) {
-      // Best-effort — try again next poll rather than surfacing an error.
-    }
   }
 
   // ---------- Add to Home Screen ----------
@@ -1306,15 +1296,6 @@
           </div>
         </div>` : '';
 
-    const notifBrokenBanner = (state.notifBroken && !state.notifBrokenDismissed) ? `
-      <div style="margin:0 16px 16px;background:#FFF3CD;border:1px solid #E8A33D;border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
-        <div>
-          <p style="margin:0;font-size:13px;font-weight:600;color:#7A5100;">🔕 Notifications are off</p>
-          <p style="margin:2px 0 0;font-size:12px;color:#7A5100;">Looks like notifications got turned off in your phone or browser's settings. Check your notification settings for this site to turn them back on.</p>
-        </div>
-        <button class="btn-ghost" onclick="dismissNotifBroken()" style="font-size:11px;padding:6px 10px;white-space:nowrap;background:#fff;">Got it</button>
-      </div>` : '';
-
     const showInstallUI = !state.installStandalone;
     const installBanner = (showInstallUI && !state.installBannerDismissed) ? `
       <div style="margin:0 16px 12px;background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 14px;display:flex;justify-content:space-between;align-items:center;gap:10px;">
@@ -1332,9 +1313,41 @@
         <button class="btn-ghost" onclick="openInstallModal()" style="font-size:11.5px;padding:5px 10px;">📲 Add to Home Screen</button>
       </div>` : '';
 
-    const mealCards = meals.length === 0
+    const si = state.menu.specialItem;
+    const specialActive = !!(si && si.active && si.name && si.name.trim());
+    const specialCard = specialActive ? `
+      <div style="padding:0 16px;margin-bottom:14px;">
+        ${si.bannerText ? `
+          <div style="background:var(--rust);color:#fff;text-align:center;border-radius:10px 10px 0 0;padding:7px 14px;">
+            <span class="mono" style="font-size:11.5px;font-weight:700;letter-spacing:0.5px;text-transform:uppercase;">✨ ${escapeHtml(si.bannerText)}</span>
+          </div>` : ''}
+        <div class="meal-card" style="border:2px solid var(--rust);${si.bannerText ? 'border-top:none;border-radius:0 0 12px 12px;' : ''}">
+          <div style="width:96px;min-width:96px;background:var(--paperDim);display:flex;align-items:center;justify-content:center;">
+            ${si.imageUrl
+              ? `<img src="${escapeHtml(si.imageUrl)}" alt="${escapeHtml(si.name)}" style="width:100%;height:100%;object-fit:cover;" onerror="this.style.display='none'">`
+              : `<span style="font-size:22px;opacity:0.35;">⭐</span>`}
+          </div>
+          <div style="flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:4px;">
+            <span class="mono" style="font-size:10.5px;color:var(--rust);letter-spacing:0.5px;text-transform:uppercase;">Special of the week</span>
+            <div style="display:flex;justify-content:space-between;gap:8px;">
+              <h3 style="font-size:15.5px;font-weight:600;margin:0;">${escapeHtml(si.name)}</h3>
+              <span class="mono" style="font-size:14px;color:var(--rust);white-space:nowrap;">$${(parseFloat(si.price) || 0).toFixed(2)}</span>
+            </div>
+            ${si.description ? `<p style="font-size:12.5px;color:var(--inkSoft);margin:0;line-height:1.4;">${escapeHtml(si.description)}</p>` : ''}
+            ${orderingOpen ? `
+              <div style="display:flex;align-items:center;gap:10px;margin-top:6px;">
+                <button class="stepper-btn" onclick="changeQty('special',-1)" aria-label="Remove one ${escapeHtml(si.name)}">−</button>
+                <span class="mono" style="min-width:18px;text-align:center;font-size:14px;">${state.qty['special'] || 0}</span>
+                <button class="stepper-btn add" onclick="changeQty('special',1)" aria-label="Add one ${escapeHtml(si.name)}">+</button>
+              </div>
+            ` : ''}
+          </div>
+        </div>
+      </div>` : '';
+
+    const mealCards = meals.length === 0 && !specialActive
       ? `<div style="text-align:center;padding:60px 24px;color:var(--inkSoft);">No meals posted yet this week. Check back soon.</div>`
-      : `<div style="padding:0 16px;display:flex;flex-direction:column;gap:14px;">
+      : meals.length === 0 ? '' : `<div style="padding:0 16px;display:flex;flex-direction:column;gap:14px;">
           ${meals.map(m => `
             <div class="meal-card">
               <div style="width:96px;min-width:96px;background:var(--paperDim);display:flex;align-items:center;justify-content:center;">
@@ -1407,8 +1420,8 @@
         </header>
         ${installButton}
         ${pushBanner}
-        ${notifBrokenBanner}
         ${installBanner}
+        ${specialCard}
         ${mealCards}
         ${closedBanner}
         <div id="bottomSpacer" style="height:24px;"></div>
@@ -1621,6 +1634,32 @@
           <button class="btn-primary" style="width:auto;padding:10px 16px;white-space:nowrap;background:${state.menu.orderingOpen !== false ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleOrderingOpen()">
             ${state.menu.orderingOpen !== false ? 'Close ordering' : 'Open ordering'}
           </button>
+        </div>
+
+        <div style="background:#fff;border:2px solid var(--rust);border-radius:12px;padding:14px;margin-bottom:20px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:10px;">
+            <div>
+              <label class="label" style="margin-bottom:2px;">✨ Special item of the week</label>
+              <p style="margin:0;font-size:13px;font-weight:600;color:${dm.specialItem && dm.specialItem.active ? 'var(--basil)' : 'var(--inkSoft)'};">
+                ${dm.specialItem && dm.specialItem.active ? 'On — showing above the menu this week' : 'Off — hidden this week'}
+              </p>
+            </div>
+            <button class="btn-primary" style="width:auto;padding:10px 16px;white-space:nowrap;background:${state.menu.specialItem && state.menu.specialItem.active ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleSpecialItemActive()">
+              ${state.menu.specialItem && state.menu.specialItem.active ? 'Turn off this week' : 'Turn on this week'}
+            </button>
+          </div>
+          <p style="font-size:11.5px;color:var(--inkSoft);margin:0 0 10px;">Fill this out and hit "Save &amp; publish menu" below, then use the button above to switch it on/off week to week without re-publishing everything.</p>
+          <input class="field" style="margin-bottom:8px;font-weight:600;" placeholder="Special item name" value="${escapeHtml(dm.specialItem ? dm.specialItem.name : '')}" oninput="setSpecialItemField('name',this.value)">
+          <input class="field" style="margin-bottom:8px;" placeholder="Banner text (e.g. \"This week only!\")" value="${escapeHtml(dm.specialItem ? dm.specialItem.bannerText : '')}" oninput="setSpecialItemField('bannerText',this.value)">
+          <textarea class="field" rows="2" style="margin-bottom:8px;resize:vertical;" placeholder="Description"
+            oninput="setSpecialItemField('description',this.value)">${escapeHtml(dm.specialItem ? dm.specialItem.description : '')}</textarea>
+          <div style="display:flex;gap:8px;">
+            <input class="field" style="width:90px;" type="number" step="0.01" placeholder="Price" value="${escapeHtml(dm.specialItem ? dm.specialItem.price : '')}" oninput="setSpecialItemField('price',this.value)">
+            <div style="flex:1;display:flex;align-items:center;gap:6px;">
+              <span style="font-size:14px;">🖼</span>
+              <input class="field" style="flex:1;" placeholder="Photo URL (Google Photos / Imgur link)" value="${escapeHtml(dm.specialItem ? dm.specialItem.imageUrl : '')}" oninput="setSpecialItemField('imageUrl',this.value)">
+            </div>
+          </div>
         </div>
 
         <h2 class="display" style="font-size:22px;font-weight:600;margin:0 0 6px;">Drop in this week's menu</h2>
