@@ -67,6 +67,13 @@
   // ---------- Supabase-backed storage (mimics window.storage's get/set/delete/list) ----------
   const SUPABASE_URL = 'https://crufaonqcxodsghirrwc.supabase.co';
   const SUPABASE_KEY = 'sb_publishable_EWI9uKlSAgMWnor_H4Z_TQ_ITMizzeO';
+  // Supabase Storage's RLS doesn't currently resolve the newer sb_publishable_ key above into
+  // the `anon` role the way PostgREST does — uploads got rejected by policies even when the
+  // policy itself was correct (tested and confirmed). Storage calls specifically need the
+  // legacy anon JWT instead — this is that key, from Supabase dashboard → Settings → API →
+  // "Legacy anon, service_role API keys" → the "anon / public" row. It's meant to be
+  // public/embeddable, same as SUPABASE_KEY above (never put the service_role key here).
+  const STORAGE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImNydWZhb25xY3hvZHNnaGlycndjIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODQ1NDk4MzgsImV4cCI6MjEwMDEyNTgzOH0.U_dV1R0FuiD6ZXgyH05_vSn0efcFNb5L02eGs0Z54ag';
   const REST = `${SUPABASE_URL}/rest/v1/kv_store`;
   // Public half of the notification key pair — safe to expose client-side, same as the
   // Supabase key above. The matching private key lives only as a Supabase Edge Function
@@ -342,7 +349,7 @@
   async function uploadPhotoToStorage(blob, path) {
     const res = await fetch(`${SUPABASE_URL}/storage/v1/object/${PHOTO_BUCKET}/${path}`, {
       method: 'POST',
-      headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' },
+      headers: { apikey: STORAGE_ANON_KEY, Authorization: `Bearer ${STORAGE_ANON_KEY}`, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' },
       body: blob,
     });
     if (!res.ok) {
