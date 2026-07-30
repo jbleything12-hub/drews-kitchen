@@ -345,8 +345,33 @@
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, 'Content-Type': 'image/jpeg', 'x-upsert': 'true' },
       body: blob,
     });
-    if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+    if (!res.ok) {
+      let detail = '';
+      try { detail = await res.text(); } catch (e) { /* ignore */ }
+      console.error('Photo upload failed', res.status, detail);
+      const err = new Error(`Upload failed (${res.status})`);
+      err.detail = detail;
+      err.status = res.status;
+      throw err;
+    }
     return `${SUPABASE_URL}/storage/v1/object/public/${PHOTO_BUCKET}/${path}`;
+  }
+  function describeUploadError(e) {
+    let msg = "Couldn't upload that photo.";
+    if (e && e.status) {
+      msg += ` Server said: ${e.status}`;
+      if (e.detail) {
+        try {
+          const parsed = JSON.parse(e.detail);
+          msg += ` — ${parsed.message || parsed.error || e.detail}`;
+        } catch (parseErr) {
+          msg += ` — ${e.detail}`;
+        }
+      }
+    } else if (e && e.message) {
+      msg += ` (${e.message}) — this often means a network/CORS issue reaching Supabase Storage.`;
+    }
+    return msg;
   }
 
   function triggerMealPhotoPicker(mealId) {
@@ -372,7 +397,7 @@
       const url = await uploadPhotoToStorage(blob, `meal-${mealId}-${Date.now()}.jpg`);
       setMealField(mealId, 'imageUrl', url);
     } catch (e) {
-      alert("Couldn't upload that photo. Make sure the \"meal-photos\" storage bucket exists and is public, then try again.");
+      alert(describeUploadError(e));
     }
     state.photoUploading = { ...state.photoUploading, [mealId]: false }; render();
   }
@@ -400,7 +425,7 @@
       const url = await uploadPhotoToStorage(blob, `special-${Date.now()}.jpg`);
       setSpecialItemField('imageUrl', url);
     } catch (e) {
-      alert("Couldn't upload that photo. Make sure the \"meal-photos\" storage bucket exists and is public, then try again.");
+      alert(describeUploadError(e));
     }
     state.specialPhotoUploading = false; render();
   }
@@ -946,6 +971,11 @@
     }
   }
 
+  // Publishing menu CONTENT (meals, special item, week label) is a separate concern from
+  // ordering open/closed, which is only ever controlled by toggleOrderingOpen. We deliberately
+  // pin orderingOpen to whatever's currently live on state.menu here, rather than whatever's
+  // sitting in draftMenu — the draft copy can go stale (e.g. it was last synced before Drew
+  // closed ordering), and publishing content should never silently flip that switch.
   async function publishMenu() {
     const named = state.draftMenu.meals.filter(m => m.name.trim() !== '');
     const missing = named.filter(m => !m.price).length;
@@ -955,7 +985,7 @@
     }
     state.saving = true; render();
     try {
-      const cleaned = { ...state.draftMenu, meals: named };
+      const cleaned = { ...state.draftMenu, meals: named, orderingOpen: state.menu.orderingOpen };
       const result = await window.storage.set('menu', JSON.stringify(cleaned));
       if (!result) throw new Error('save failed');
       state.menu = cleaned;
