@@ -669,15 +669,17 @@
   function setCustomerName(v) { state.customerName = v; }
   function setPinInput(v) { state.pinInput = v; state.pinError = false; }
   function setPasteText(v) { state.pasteText = v; }
-  function setWeekLabel(v) { state.draftMenu.weekLabel = v; scheduleAutosave(); }
+  function setWeekLabel(v) { state.draftMenu.weekLabel = v; scheduleAutosave(); updateDirtyIndicator(); }
   function setVenmoUsername(v) { state.draftMenu.venmoUsername = v; scheduleAutosave(); }
   function setMealField(id, field, v) {
     state.draftMenu.meals = state.draftMenu.meals.map(m => m.id === id ? { ...m, [field]: v } : m);
     scheduleAutosave();
+    updateDirtyIndicator();
   }
   function setSpecialItemField(field, v) {
     state.draftMenu.specialItem = { ...(state.draftMenu.specialItem || emptySpecialItem()), [field]: v };
     scheduleAutosave();
+    updateDirtyIndicator();
   }
 
   function setPaidCheckbox(v) { state.paidCheckbox = v; render(); }
@@ -988,14 +990,79 @@
   }
 
   // True whenever the draft differs from what's actually live for customers — drives the
-  // "unpublished changes" banner/button highlight below. orderingOpen is deliberately excluded
-  // from the comparison: publishing always pins it to the current live value regardless of
-  // what's in the draft (see publishMenu below), so a mismatch there alone doesn't mean
-  // anything would actually change if Drew hit publish.
+  // "unpublished changes" banner/button highlight below. orderingOpen and specialItem.active
+  // are deliberately excluded from the comparison: both are independently synced by their own
+  // instant toggle buttons (toggleOrderingOpen / toggleSpecialItemActive) regardless of what's
+  // in the draft, so a mismatch there alone doesn't mean anything would actually change if
+  // Drew hit publish.
+  function stripForDiff(menu) {
+    if (!menu) return menu;
+    const { orderingOpen, ...rest } = menu;
+    if (rest.specialItem) {
+      const { active, ...specialRest } = rest.specialItem;
+      rest.specialItem = specialRest;
+    }
+    return rest;
+  }
   function hasUnpublishedChanges() {
     if (!state.draftMenu) return false;
-    const strip = (m) => { const { orderingOpen, ...rest } = m || {}; return rest; };
-    return JSON.stringify(strip(state.draftMenu)) !== JSON.stringify(strip(state.menu));
+    return JSON.stringify(stripForDiff(state.draftMenu)) !== JSON.stringify(stripForDiff(state.menu));
+  }
+  function mealHasChanges(m) {
+    const published = state.menu.meals.find(pm => pm.id === m.id);
+    if (!published) return true; // not live yet at all
+    return JSON.stringify(m) !== JSON.stringify(published);
+  }
+  function specialItemHasChanges() {
+    const stripActive = (si) => { if (!si) return si; const { active, ...rest } = si; return rest; };
+    return JSON.stringify(stripActive(state.draftMenu.specialItem)) !== JSON.stringify(stripActive(state.menu.specialItem));
+  }
+
+  // ---------- undo / revert ----------
+  function revertMeal(mealId) {
+    const published = state.menu.meals.find(pm => pm.id === mealId);
+    if (published) {
+      state.draftMenu.meals = state.draftMenu.meals.map(dm => dm.id === mealId ? { ...published } : dm);
+    } else {
+      // Never published — "revert" means undo adding it in the first place.
+      state.draftMenu.meals = state.draftMenu.meals.filter(dm => dm.id !== mealId);
+    }
+    scheduleAutosave();
+    render();
+  }
+  function revertSpecialItem() {
+    const current = state.draftMenu.specialItem || emptySpecialItem();
+    const published = state.menu.specialItem || emptySpecialItem();
+    state.draftMenu.specialItem = { ...published, active: current.active };
+    scheduleAutosave();
+    render();
+  }
+  function undoAllChanges() {
+    if (!confirm("Undo all unpublished menu changes and go back to what's currently live? This can't be undone.")) return;
+    const activeNow = (state.draftMenu.specialItem || {}).active;
+    state.draftMenu = JSON.parse(JSON.stringify(state.menu));
+    if (state.draftMenu.specialItem) state.draftMenu.specialItem.active = activeNow;
+    scheduleAutosave();
+    render();
+  }
+
+  function publishBannerHtml() {
+    if (!hasUnpublishedChanges()) return '';
+    return `
+      <div style="background:#FFF3E0;border:1.5px solid var(--rust);border-radius:10px;padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+        <span style="font-size:15px;">⚠️</span>
+        <span style="font-size:12.5px;color:var(--ink);flex:1;">You've got changes that aren't live yet — customers won't see them until you hit <strong>Save &amp; publish menu</strong>.</span>
+        <button type="button" onclick="undoAllChanges()" style="background:none;border:1px solid var(--rust);color:var(--rust);border-radius:6px;padding:4px 8px;font-size:11.5px;cursor:pointer;white-space:nowrap;">↩ Undo all</button>
+      </div>`;
+  }
+  function updateDirtyIndicator() {
+    const area = document.getElementById('publishStatusArea');
+    const btn = document.getElementById('publishBtn');
+    if (!area || !btn) return; // not currently viewing the kitchen menu editor
+    const dirty = hasUnpublishedChanges();
+    area.innerHTML = publishBannerHtml();
+    btn.style.boxShadow = dirty ? '0 0 0 3px rgba(201,90,110,0.35)' : '';
+    btn.textContent = state.saving ? 'Saving…' : (dirty ? '● Save & publish menu' : 'Save & publish menu');
   }
 
   // Publishing menu CONTENT (meals, special item, week label) is a separate concern from
@@ -1852,7 +1919,10 @@
       <div style="background:#fff;border:1px solid var(--line);border-radius:12px;padding:14px;">
         <div style="display:flex;justify-content:space-between;margin-bottom:8px;">
           <span class="mono" style="font-size:11px;color:var(--inkSoft);">MEAL ${idx + 1}</span>
-          <button class="btn-icon" style="color:var(--rust);" onclick="removeDraftMeal('${m.id}')">🗑</button>
+          <div style="display:flex;gap:6px;align-items:center;">
+            ${mealHasChanges(m) ? `<button class="btn-icon" title="Revert this meal to what's live" style="color:var(--inkSoft);font-size:13px;" onclick="revertMeal('${m.id}')">↩</button>` : ''}
+            <button class="btn-icon" style="color:var(--rust);" onclick="removeDraftMeal('${m.id}')">🗑</button>
+          </div>
         </div>
         <div style="display:flex;gap:8px;margin-bottom:8px;">
           <input class="field" style="width:90px;" placeholder="Day" value="${escapeHtml(m.day)}" oninput="setMealField('${m.id}','day',this.value)">
@@ -1982,9 +2052,12 @@
                 ${dm.specialItem && dm.specialItem.active ? 'On — showing above the menu this week' : 'Off — hidden this week'}
               </p>
             </div>
-            <button class="btn-primary" style="width:auto;padding:10px 16px;white-space:nowrap;background:${state.menu.specialItem && state.menu.specialItem.active ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleSpecialItemActive()">
-              ${state.menu.specialItem && state.menu.specialItem.active ? 'Turn off this week' : 'Turn on this week'}
-            </button>
+            <div style="display:flex;align-items:center;gap:8px;">
+              ${specialItemHasChanges() ? `<button class="btn-icon" title="Revert to what's live" style="color:var(--inkSoft);font-size:13px;" onclick="revertSpecialItem()">↩</button>` : ''}
+              <button class="btn-primary" style="width:auto;padding:10px 16px;white-space:nowrap;background:${state.menu.specialItem && state.menu.specialItem.active ? 'var(--rust)' : 'var(--basil)'};" onclick="toggleSpecialItemActive()">
+                ${state.menu.specialItem && state.menu.specialItem.active ? 'Turn off this week' : 'Turn on this week'}
+              </button>
+            </div>
           </div>
           <p style="font-size:11.5px;color:var(--inkSoft);margin:0 0 10px;">Fill this out and hit "Save &amp; publish menu" below, then use the button above to switch it on/off week to week without re-publishing everything.</p>
           <input class="field" style="margin-bottom:8px;font-weight:600;" placeholder="Special item name" value="${escapeHtml(dm.specialItem ? dm.specialItem.name : '')}" oninput="setSpecialItemField('name',this.value)">
@@ -2058,15 +2131,8 @@
         <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">${mealCards}</div>
 
         <button class="btn-ghost" onclick="addDraftMeal()" style="margin-bottom:20px;">+ Add a meal</button>
-        ${hasUnpublishedChanges() ? `
-          <div style="background:#FFF3E0;border:1.5px solid var(--rust);border-radius:10px;padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
-            <span style="font-size:15px;">⚠️</span>
-            <span style="font-size:12.5px;color:var(--ink);">You've got changes that aren't live yet — customers won't see them until you hit <strong>Save &amp; publish menu</strong>.</span>
-          </div>
-        ` : ''}
-        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:12px;${hasUnpublishedChanges() ? 'box-shadow:0 0 0 3px rgba(201,90,110,0.35);' : ''}" ${state.saving ? 'disabled' : ''}>
-          ${state.saving ? 'Saving…' : (hasUnpublishedChanges() ? '● Save & publish menu' : 'Save & publish menu')}
-        </button>
+        <div id="publishStatusArea">${publishBannerHtml()}</div>
+        <button id="publishBtn" class="btn-primary" onclick="publishMenu()" style="margin-bottom:12px;${hasUnpublishedChanges() ? 'box-shadow:0 0 0 3px rgba(201,90,110,0.35);' : ''}" ${state.saving ? 'disabled' : ''}>${state.saving ? 'Saving…' : (hasUnpublishedChanges() ? '● Save & publish menu' : 'Save & publish menu')}</button>
         <button class="btn-ghost" onclick="clearPublishedMenu()" style="margin-bottom:36px;color:var(--rust);">🧹 Clear customer-facing menu</button>
 
         <div style="border-top:1px solid var(--line);padding-top:24px;">
