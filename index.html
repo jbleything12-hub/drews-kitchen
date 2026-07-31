@@ -985,6 +985,17 @@
     }
   }
 
+  // True whenever the draft differs from what's actually live for customers — drives the
+  // "unpublished changes" banner/button highlight below. orderingOpen is deliberately excluded
+  // from the comparison: publishing always pins it to the current live value regardless of
+  // what's in the draft (see publishMenu below), so a mismatch there alone doesn't mean
+  // anything would actually change if Drew hit publish.
+  function hasUnpublishedChanges() {
+    if (!state.draftMenu) return false;
+    const strip = (m) => { const { orderingOpen, ...rest } = m || {}; return rest; };
+    return JSON.stringify(strip(state.draftMenu)) !== JSON.stringify(strip(state.menu));
+  }
+
   // Publishing menu CONTENT (meals, special item, week label) is a separate concern from
   // ordering open/closed, which is only ever controlled by toggleOrderingOpen. We deliberately
   // pin orderingOpen to whatever's currently live on state.menu here, rather than whatever's
@@ -1196,7 +1207,13 @@
 
   function openKitchen() { state.view = 'pinGate'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
   function backToOrder() { state.view = 'order'; state.pinInput = ''; state.pinError = false; state.forgotMode = false; render(); }
-  function exitKitchen() { state.view = 'order'; render(); }
+  function exitKitchen() {
+    if (hasUnpublishedChanges()) {
+      const leave = confirm("You've got menu changes that haven't been published yet — customers won't see them. Leave anyway without publishing?");
+      if (!leave) return;
+    }
+    state.view = 'order'; render();
+  }
   function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
@@ -2039,8 +2056,14 @@
         <div style="display:flex;flex-direction:column;gap:12px;margin-bottom:12px;">${mealCards}</div>
 
         <button class="btn-ghost" onclick="addDraftMeal()" style="margin-bottom:20px;">+ Add a meal</button>
-        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:12px;" ${state.saving ? 'disabled' : ''}>
-          ${state.saving ? 'Saving…' : 'Save & publish menu'}
+        ${hasUnpublishedChanges() ? `
+          <div style="background:#FFF3E0;border:1.5px solid var(--rust);border-radius:10px;padding:10px 12px;margin-bottom:10px;display:flex;align-items:center;gap:8px;">
+            <span style="font-size:15px;">⚠️</span>
+            <span style="font-size:12.5px;color:var(--ink);">You've got changes that aren't live yet — customers won't see them until you hit <strong>Save &amp; publish menu</strong>.</span>
+          </div>
+        ` : ''}
+        <button class="btn-primary" onclick="publishMenu()" style="margin-bottom:12px;${hasUnpublishedChanges() ? 'box-shadow:0 0 0 3px rgba(201,90,110,0.35);' : ''}" ${state.saving ? 'disabled' : ''}>
+          ${state.saving ? 'Saving…' : (hasUnpublishedChanges() ? '● Save & publish menu' : 'Save & publish menu')}
         </button>
         <button class="btn-ghost" onclick="clearPublishedMenu()" style="margin-bottom:36px;color:var(--rust);">🧹 Clear customer-facing menu</button>
 
@@ -2112,6 +2135,12 @@
     `;
   }
 
+  window.addEventListener('beforeunload', (e) => {
+    if (state.view === 'kitchen' && hasUnpublishedChanges()) {
+      e.preventDefault();
+      e.returnValue = '';
+    }
+  });
   window.addEventListener('resize', sizeBottomSpacer);
 
   loadAuth();
