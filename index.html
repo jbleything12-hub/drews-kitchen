@@ -383,9 +383,11 @@
 
   function clearMealPhoto(mealId) {
     setMealField(mealId, 'imageUrl', '');
+    render();
   }
   function clearSpecialPhoto() {
     setSpecialItemField('imageUrl', '');
+    render();
   }
 
   function triggerMealPhotoPicker(mealId) {
