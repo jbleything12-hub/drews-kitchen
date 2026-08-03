@@ -146,6 +146,7 @@
   };
 
   const DREW_VENMO = 'Andrew-Dzib-Galvan';
+  const DELIVERY_FEE = 5;
   const DAY_NAMES = ['monday','tuesday','wednesday','thursday','friday','saturday','sunday'];
   // Supabase Storage bucket for drag-and-dropped meal/special-item photos. Must be created
   // as a PUBLIC bucket in the Supabase dashboard first (Storage → New bucket → "meal-photos"),
@@ -175,6 +176,7 @@
     auth: { pin: '2468', question: '', answer: '' },
     qty: {},
     customerName: '',
+    delivery: false,
     paymentStep: false,
     paidCheckbox: false,
     submitting: false,
@@ -216,6 +218,7 @@
     archivedLoading: false,
     showArchived: false,
     exportingXlsx: false,
+    orderReadyBusy: false,
     photoUploading: {},
     specialPhotoUploading: false,
   };
@@ -673,8 +676,11 @@
     }
     return items;
   }
-  function totalDue() {
+  function mealsSubtotal() {
     return orderableItems().reduce((sum, m) => sum + (state.qty[m.id] || 0) * (parseFloat(m.price) || 0), 0);
+  }
+  function totalDue() {
+    return mealsSubtotal() + (state.delivery ? DELIVERY_FEE : 0);
   }
   function selectedCount() {
     return Object.values(state.qty).reduce((a, b) => a + b, 0);
@@ -692,6 +698,7 @@
   }
 
   function setCustomerName(v) { state.customerName = v; }
+  function setDelivery(v) { state.delivery = v; render(); }
   function setPinInput(v) { state.pinInput = v; state.pinError = false; }
   function setPasteText(v) { state.pasteText = v; }
   function setWeekLabel(v) { state.draftMenu.weekLabel = v; scheduleAutosave(); updateDirtyIndicator(); }
@@ -736,6 +743,7 @@
       const order = {
         customerName: state.customerName.trim(), items, total: totalDue(), timestamp: Date.now(),
         customerConfirmedPaid: true, paidConfirmed: false,
+        delivery: !!state.delivery, deliveryFee: state.delivery ? DELIVERY_FEE : 0,
         weekLabel: state.menu.weekLabel, orderId,
       };
       const result = await window.storage.set(`order:${state.menu.weekLabel}:${orderId}`, JSON.stringify(order));
@@ -743,7 +751,8 @@
       state.confirmed = order;
       state.paymentStep = false;
       state.paidCheckbox = false;
-      notifyNewOrder(order.customerName, order.total, state.menu.weekLabel);
+      state.delivery = false;
+      notifyNewOrder(order.customerName, order.total, state.menu.weekLabel, order.delivery);
       linkOrderToExistingSubscription(order.weekLabel, order.orderId);
     } catch (e) {
       state.orderError = 'Something went wrong sending your order. Please try again.';
@@ -1161,13 +1170,14 @@
       const byName = {};
       state.orders.forEach(o => {
         if (!byName[o.customerName]) {
-          byName[o.customerName] = { name: o.customerName, counts: {} };
+          byName[o.customerName] = { name: o.customerName, counts: {}, deliveryFee: 0 };
           columns.forEach(c => { byName[o.customerName].counts[c.id] = 0; });
         }
         o.items.forEach(it => {
           const col = columns.find(c => c.id === it.mealId) || columns.find(c => c.id === '__other__');
           if (col) byName[o.customerName].counts[col.id] += it.qty;
         });
+        if (o.delivery) byName[o.customerName].deliveryFee += (o.deliveryFee || DELIVERY_FEE);
       });
       const rows = Object.values(byName).map(r => ({
         ...r, total: columns.reduce((s, c) => s + (r.counts[c.id] || 0), 0),
@@ -1175,14 +1185,19 @@
 
       const colTotals = columns.map(c => rows.reduce((s, r) => s + (r.counts[c.id] || 0), 0));
       const grandTotal = colTotals.reduce((a, b) => a + b, 0);
+      const grandDeliveryFees = rows.reduce((s, r) => s + (r.deliveryFee || 0), 0);
 
       const wb = new window.ExcelJS.Workbook();
       const ws = wb.addWorksheet('Meal Prep');
-      const numCols = 1 + columns.length + 1; // Name + one per meal + Total Meals
+      // Name + one per meal + Total Meals + Delivery Fee
+      const totalMealsCol = 1 + columns.length + 1;
+      const deliveryCol = totalMealsCol + 1;
+      const numCols = deliveryCol;
 
       ws.getColumn(1).width = 16;
       columns.forEach((c, i) => { ws.getColumn(2 + i).width = 18; });
-      ws.getColumn(numCols).width = 12;
+      ws.getColumn(totalMealsCol).width = 12;
+      ws.getColumn(deliveryCol).width = 14;
 
       const thin = { style: 'thin', color: { argb: 'FF000000' } };
       const allBorders = { top: thin, left: thin, bottom: thin, right: thin };
@@ -1201,7 +1216,8 @@
       const headerRow = ws.getRow(2);
       headerRow.getCell(1).value = 'Name';
       columns.forEach((c, i) => { headerRow.getCell(2 + i).value = c.dayLabel; });
-      headerRow.getCell(numCols).value = 'Total Meals';
+      headerRow.getCell(totalMealsCol).value = 'Total Meals';
+      headerRow.getCell(deliveryCol).value = 'Delivery Fee';
       for (let c = 1; c <= numCols; c++) {
         const cell = ws.getCell(2, c);
         cell.font = { bold: true };
@@ -1216,7 +1232,7 @@
       for (let c = 1; c <= numCols; c++) {
         const cell = ws.getCell(3, c);
         cell.alignment = { horizontal: 'center', vertical: 'middle', wrapText: true };
-        if (c === 1 || c === numCols) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A1A' } };
+        if (c === 1 || c === totalMealsCol || c === deliveryCol) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A1A1A' } };
       }
       ws.getRow(3).height = 30;
       applyBorders(3, numCols);
@@ -1228,8 +1244,14 @@
         dataRow.getCell(1).value = row.name;
         dataRow.getCell(1).font = { bold: true };
         columns.forEach((c, i) => { dataRow.getCell(2 + i).value = row.counts[c.id] || 0; });
-        dataRow.getCell(numCols).value = row.total;
-        dataRow.getCell(numCols).font = { bold: true };
+        dataRow.getCell(totalMealsCol).value = row.total;
+        dataRow.getCell(totalMealsCol).font = { bold: true };
+        if (row.deliveryFee) {
+          const dCell = dataRow.getCell(deliveryCol);
+          dCell.value = row.deliveryFee;
+          dCell.numFmt = '"$"#,##0.00';
+          dCell.font = { bold: true };
+        }
         for (let c = 1; c <= numCols; c++) {
           ws.getCell(r, c).alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
         }
@@ -1245,8 +1267,14 @@
         totalRow.getCell(2 + i).value = t;
         totalRow.getCell(2 + i).font = { bold: true };
       });
-      totalRow.getCell(numCols).value = grandTotal;
-      totalRow.getCell(numCols).font = { bold: true };
+      totalRow.getCell(totalMealsCol).value = grandTotal;
+      totalRow.getCell(totalMealsCol).font = { bold: true };
+      if (grandDeliveryFees) {
+        const dTotalCell = totalRow.getCell(deliveryCol);
+        dTotalCell.value = grandDeliveryFees;
+        dTotalCell.numFmt = '"$"#,##0.00';
+        dTotalCell.font = { bold: true };
+      }
       for (let c = 1; c <= numCols; c++) {
         const cell = ws.getCell(r, c);
         cell.alignment = { horizontal: c === 1 ? 'left' : 'center', vertical: 'middle' };
@@ -1308,7 +1336,7 @@
     }
     state.view = 'order'; render();
   }
-  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.paymentStep = false; state.paidCheckbox = false; render(); }
+  function placeAnotherOrder() { state.confirmed = null; state.qty = {}; state.customerName = ''; state.delivery = false; state.paymentStep = false; state.paidCheckbox = false; render(); }
   function reloadOrders() { loadOrders(state.draftMenu.weekLabel); }
 
   async function togglePaidConfirmed(key) {
@@ -1423,6 +1451,28 @@
   }
   function openInstallModal() { state.showInstallModal = true; render(); }
   function closeInstallModal() { state.showInstallModal = false; render(); }
+
+  // ---------- "order ready" broadcast to everyone with an order this week ----------
+  // One tap, one push per subscribed order for the current week — reuses the same
+  // targeting mechanism as payment-confirmed (orderPushSub:{weekLabel}:{orderId}), but
+  // fans out to ALL of them instead of just one. Requires the send-push Edge Function to
+  // support target:'week' by looping every orderPushSub: key under this weekLabel — see
+  // deploy note.
+  async function notifyOrdersReady() {
+    const proceed = confirm(`Send "your order is ready" to everyone who ordered for ${state.menu.weekLabel}?`);
+    if (!proceed) return;
+    state.orderReadyBusy = true; render();
+    try {
+      await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event: 'order_ready', target: 'week', weekLabel: state.menu.weekLabel }),
+      });
+    } catch (e) {
+      alert('Could not send the notification. Please try again.');
+    }
+    state.orderReadyBusy = false; render();
+  }
 
   async function notifyStatusChange(eventType, weekLabel, target) {
     try {
@@ -1604,12 +1654,12 @@
     render();
   }
 
-  async function notifyNewOrder(customerName, total, weekLabel) {
+  async function notifyNewOrder(customerName, total, weekLabel, delivery) {
     try {
       await fetch(`${SUPABASE_URL}/functions/v1/send-push`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event: 'new_order', target: 'drew', customerName, total, weekLabel }),
+        body: JSON.stringify({ event: 'new_order', target: 'drew', customerName, total, weekLabel, delivery: !!delivery }),
       });
     } catch (e) {
       // Best-effort — never block the customer's order confirmation on a push failure.
@@ -1809,12 +1859,17 @@
           ${!state.paymentStep ? `
             <input class="field" style="margin-bottom:8px;background:#4F2438;color:#fff;border-color:#6B3550;" placeholder="Your name"
               value="${escapeHtml(state.customerName)}" oninput="setCustomerName(this.value)">
+            <label style="display:flex;align-items:center;gap:8px;font-size:12.5px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
+              <input type="checkbox" ${state.delivery ? 'checked' : ''} onchange="setDelivery(this.checked)">
+              <span>🚚 Add delivery (+$${DELIVERY_FEE.toFixed(2)})</span>
+            </label>
             ${state.orderError ? `<p style="color:var(--butter);font-size:12.5px;margin:0 0 8px;">${escapeHtml(state.orderError)}</p>` : ''}
             <button class="btn-primary" onclick="goToPayment()">Continue to payment</button>
           ` : `
+            ${state.delivery ? `<p style="font-size:11.5px;color:#D9AFC0;margin:0 0 8px;">Includes 🚚 delivery (+$${DELIVERY_FEE.toFixed(2)})</p>` : ''}
             <p style="font-size:12.5px;color:#D9AFC0;margin:0 0 10px;">Send <strong style="color:#fff;">$${td.toFixed(2)}</strong> to Drew, then check the box below to send your order.</p>
-            <a class="venmo-link" href="${venmoHref(td, `${state.menu.weekLabel} — ${state.customerName.trim()}`)}"><button class="btn-primary" style="background:#3D95CE;margin-bottom:6px;" type="button">Pay $${td.toFixed(2)} with Venmo</button></a>
-            <p style="font-size:11.5px;color:#C79AAE;margin:0 0 10px;line-height:1.4;">On a computer? That button only opens the Venmo app on a phone. Instead, send <strong style="color:#D9AFC0;">$${td.toFixed(2)}</strong> to <strong style="color:#D9AFC0;">@${DREW_VENMO}</strong> with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(state.customerName.trim())}" via the Venmo app or <a href="${venmoWebFallback()}" style="color:#F5A9C7;">${venmoWebFallback()}</a>.</p>
+            <a class="venmo-link" href="${venmoHref(td, `${state.menu.weekLabel} — ${state.customerName.trim()}${state.delivery ? ' (delivery)' : ''}`)}"><button class="btn-primary" style="background:#3D95CE;margin-bottom:6px;" type="button">Pay $${td.toFixed(2)} with Venmo</button></a>
+            <p style="font-size:11.5px;color:#C79AAE;margin:0 0 10px;line-height:1.4;">On a computer? That button only opens the Venmo app on a phone. Instead, send <strong style="color:#D9AFC0;">$${td.toFixed(2)}</strong> to <strong style="color:#D9AFC0;">@${DREW_VENMO}</strong> with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(state.customerName.trim())}${state.delivery ? ' (delivery)' : ''}" via the Venmo app or <a href="${venmoWebFallback()}" style="color:#F5A9C7;">${venmoWebFallback()}</a>.</p>
             <label style="display:flex;align-items:flex-start;gap:8px;font-size:12.5px;color:#D9AFC0;margin-bottom:10px;cursor:pointer;">
               <input type="checkbox" ${state.paidCheckbox ? 'checked' : ''} onchange="setPaidCheckbox(this.checked)" style="margin-top:2px;">
               <span>I've sent $${td.toFixed(2)} to Drew via Venmo</span>
@@ -1853,7 +1908,10 @@
     const receiptRows = c.items.map(it => `
       <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;">
         <span>${it.qty} × ${escapeHtml(it.name)}</span><span>$${(it.qty * it.price).toFixed(2)}</span>
-      </div>`).join('');
+      </div>`).join('') + (c.delivery ? `
+      <div class="mono" style="display:flex;justify-content:space-between;font-size:13px;padding:4px 0;color:var(--rust);">
+        <span>🚚 Delivery</span><span>$${(c.deliveryFee || DELIVERY_FEE).toFixed(2)}</span>
+      </div>` : '');
 
     const orderPushSupported = ('serviceWorker' in navigator) && ('PushManager' in window);
     const orderPushBlock = !orderPushSupported ? '' : state.pushSubscribed
@@ -1878,7 +1936,7 @@
         </div>
         <p style="font-size:12px;color:var(--inkSoft);text-align:center;margin-top:16px;">
           Didn't finish sending payment yet? Send <strong>$${c.total.toFixed(2)}</strong> to <strong>@${DREW_VENMO}</strong>
-          with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}" — or visit
+          with note "${escapeHtml(state.menu.weekLabel)} — ${escapeHtml(c.customerName)}${c.delivery ? ' (delivery)' : ''}" — or visit
           <a href="${venmoWebFallback()}" style="color:var(--basil);">${venmoWebFallback()}</a>
         </p>
         ${orderPushBlock}
@@ -1988,8 +2046,11 @@
         <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:14px;">
           ${state.orders.map(o => `
             <div style="background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px;">
-              <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;gap:8px;">
+                <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+                  <strong style="font-size:14px;">${escapeHtml(o.customerName)}</strong>
+                  ${o.delivery ? `<span class="mono" style="font-size:10.5px;background:var(--paperDim);color:var(--rust);border-radius:6px;padding:2px 7px;font-weight:600;white-space:nowrap;">🚚 Delivery +$${(o.deliveryFee || DELIVERY_FEE).toFixed(2)}</span>` : ''}
+                </div>
                 <div style="display:flex;align-items:center;gap:10px;">
                   <span class="mono" style="font-size:14px;color:var(--rust);">$${o.total.toFixed(2)}</span>
                   <button class="btn-icon" style="color:var(--inkSoft);" onclick="deleteOrder('${o.key}')">✕</button>
@@ -2165,6 +2226,10 @@
             <h2 class="display" style="font-size:22px;font-weight:600;margin:0;">Orders — ${escapeHtml(state.menu.weekLabel)}</h2>
             <button class="btn-ghost" onclick="reloadOrders()" title="Manually refresh the orders list" style="font-size:12px;">🧾 Refresh</button>
           </div>
+          ${state.orders.length > 0 ? `
+          <button class="btn-primary" ${state.orderReadyBusy ? 'disabled' : ''} onclick="notifyOrdersReady()" style="margin-bottom:14px;background:var(--rust);opacity:${state.orderReadyBusy ? 0.7 : 1};">
+            ${state.orderReadyBusy ? 'Sending…' : `📦 Notify everyone this week — order ready for pickup`}
+          </button>` : ''}
           ${ordersHtml}
           <div style="margin-top:16px;">${archivedHtml}</div>
         </div>
